@@ -1,0 +1,48 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  height: 100%;
+  background: #000;
+}
+
+body {
+  font-family: "JetBrains Mono", Menlo, monospace;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* tighten range slider for the strategy panel */
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+}
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 1px;
+  background: #27272a;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 10px;
+  width: 10px;
+  background: #10b981;
+  margin-top: -4.5px;
+  border-radius: 0;
+}
+input[type="range"]:disabled::-webkit-slider-thumb {
+  background: #52525b;
+}
+
+/* hide scrollbar in tables, keep functionality */
+.scroll-thin::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.scroll-thin::-webkit-scrollbar-thumb {
+  background: #27272a;
+}

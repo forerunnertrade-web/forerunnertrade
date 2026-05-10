@@ -1,0 +1,28 @@
+# Railway service configuration.
+#
+# Tells Railway:
+#   1. Build using the Dockerfile (not the auto-detected Python buildpack)
+#   2. Restart the container if it crashes (vs giving up after one failure)
+#   3. Use the /health endpoint to gate "deployed" status
+#
+# Railway picks up env vars from the project's Variables tab in the
+# dashboard, NOT from this file or any committed .env. That's intentional:
+# secrets stay in Railway, this file stays in git.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# Health check — Railway calls this every few seconds. Returning non-200
+# marks the deploy as unhealthy, which can roll back to the previous
+# deploy if you've configured that in the dashboard.
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+
+# Restart policy. ALWAYS = restart whenever the process exits, including
+# clean exits. ON_FAILURE = only restart on non-zero exits.
+# We want ALWAYS because long-running scanners can drop their WS and exit
+# in edge cases — auto-restart is the recovery mechanism.
+restartPolicyType = "ALWAYS"
+restartPolicyMaxRetries = 10

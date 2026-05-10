@@ -1,0 +1,88 @@
+//@version=5
+// =============================================================================
+// Early Breakout Scanner
+//
+// Designed for low-timeframe charts (1m / 5m) on freshly listed tokens. Detects
+// the first candle that combines:
+//
+//   1. Volume spike  (volume > MA * multiplier)
+//   2. Momentum      (RSI above threshold AND close above N-bar prior high)
+//   3. Trend filter  (close above EMA — optional)
+//   4. Min bars listed + cooldown to suppress launch noise
+//
+// Webhook: the alert message is JSON shaped to match the FastAPI /tv-webhook
+// endpoint in alerts.py. Configure the alert with a webhook URL pointing at
+// http://your-host:8080/tv-webhook and TradingView will POST the payload.
+//
+// Scope notes (re: "undeclared identifier" errors during volatile launches):
+//   - All inputs and series are declared at top level; no nested `var` inside
+//     conditional blocks, which is the usual cause of phantom-undefined errors.
+//   - Only one piece of mutable state (`lastSignalBar`) and it's read before
+//     it's written each bar.
+//   - No `request.security` calls — those introduce repaint and lookahead
+//     traps that make low-TF launch detection unreliable.
+// =============================================================================
+indicator("Early Breakout Scanner", overlay=true, max_labels_count=200)
+
+// --- Inputs -----------------------------------------------------------------
+grpVol        = "Volume"
+volLookback   = input.int(20,   "Volume MA length",        minval=2,  group=grpVol)
+volMultiplier = input.float(3.0,"Volume spike multiplier", minval=1,  step=0.1, group=grpVol)
+
+grpMom        = "Momentum"
+rsiLength     = input.int(14,   "RSI length",              minval=2,  group=grpMom)
+rsiThreshold  = input.float(60, "RSI breakout threshold",  minval=50, maxval=90, group=grpMom)
+breakoutLB    = input.int(20,   "Breakout high lookback",  minval=2,  group=grpMom)
+
+grpFilt       = "Filters"
+useEmaFilter  = input.bool(true,"Require close > EMA",     group=grpFilt)
+emaLength     = input.int(50,   "EMA length",              minval=2,  group=grpFilt)
+minBarsListed = input.int(3,    "Min bars since listing",  minval=1,  group=grpFilt)
+cooldownBars  = input.int(10,   "Bars between signals",    minval=1,  group=grpFilt)
+
+// --- Calculations -----------------------------------------------------------
+volMa     = ta.sma(volume, volLookback)
+volSpike  = volume > volMa * volMultiplier
+
+rsiVal    = ta.rsi(close, rsiLength)
+priorHigh = ta.highest(high[1], breakoutLB)   // [1] so current bar can break it
+breakout  = close > priorHigh
+
+emaVal    = ta.ema(close, emaLength)
+trendOk   = not useEmaFilter or close > emaVal
+
+barsListed = bar_index + 1
+listedOk   = barsListed >= minBarsListed
+
+// Cooldown — the only mutable state in the script.
+var int lastSignalBar = na
+cooldownOk = na(lastSignalBar) or (bar_index - lastSignalBar) >= cooldownBars
+
+momentumOk = rsiVal > rsiThreshold and breakout
+signal     = volSpike and momentumOk and trendOk and listedOk and cooldownOk
+
+if signal
+    lastSignalBar := bar_index
+
+// --- Plots ------------------------------------------------------------------
+plot(emaVal,    title="EMA",        color=color.new(color.orange, 0))
+plot(priorHigh, title="Prior high", color=color.new(color.gray, 60), style=plot.style_stepline)
+
+plotshape(signal, title="Breakout", style=shape.triangleup,
+          location=location.belowbar, color=color.new(color.lime, 0),
+          size=size.small, text="BO")
+
+bgcolor(volSpike ? color.new(color.aqua, 88) : na, title="Vol spike highlight")
+
+// --- Alerts -----------------------------------------------------------------
+// JSON payload matched to the FastAPI /tv-webhook handler. {{ticker}}, {{close}},
+// {{volume}} are TradingView placeholders evaluated at fire time; rsiVal is
+// embedded with str.tostring so the bot sees the exact value at signal bar.
+alertMsg = '{"ticker":"{{ticker}}","action":"breakout","price":{{close}},"volume":{{volume}},"rsi":' + str.tostring(rsiVal, "#.##") + ',"message":"Vol+RSI breakout"}'
+
+alertcondition(signal, title="Breakout signal", message=alertMsg)
+
+// Optional: also fire the dynamic alert() call so users on Pro+ tiers get a
+// per-bar JSON push without having to manually create an alertcondition.
+if signal
+    alert(alertMsg, alert.freq_once_per_bar_close)

@@ -1,0 +1,16 @@
+# Don't ship local dev junk to Railway. Each line is a glob.
+.env
+.env.local
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+.DS_Store
+*.log
+README.md
+HELP.md
+.git/
+.gitignore
