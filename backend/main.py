@@ -33,7 +33,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("main")
 
-API_HOST = os.getenv("API_HOST", "127.0.0.1")
+API_HOST = os.getenv("API_HOST", "0.0.0.0")
 # Railway and most PaaS providers inject $PORT for the container to bind.
 # Fall back to API_PORT (our local convention) then 8080 (the default).
 API_PORT = int(os.getenv("PORT") or os.getenv("API_PORT") or "8080")
