@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo } from "react";
 import * as persistence from "./persistence";
+import * as backendClient from "./backendClient";
 import {
   LineChart,
   Line,
@@ -490,6 +491,17 @@ export default function App() {
 
   const [signalSource, setSignalSource] = useState("synthetic");
   const [enabledChains, setEnabledChains] = useState(["ETH", "SOL", "SUI"]);
+  // Engine mode: "local" runs the React tick loop (legacy/synthetic-friendly);
+  // "remote" hands control to the backend engine (runs 24/7 even with no
+  // dashboard open). Default to local so existing users aren't surprised.
+  const [engineMode, setEngineMode] = useState(() => {
+    try { return localStorage.getItem("forerunner.engineMode") || "local"; }
+    catch (_) { return "local"; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem("forerunner.engineMode", engineMode); } catch (_) {}
+  }, [engineMode]);
+  const [remoteEngineHealthy, setRemoteEngineHealthy] = useState(false);
   const [wsStatus, setWsStatus] = useState("disconnected");
   const wsRef = useRef(null);
   const liveSignalQueueRef = useRef([]);
@@ -533,8 +545,11 @@ export default function App() {
     setWsStatus("connecting");
     // Backend URL: VITE_BACKEND_WS_URL takes precedence; falls back to
     // localhost for dev. Use wss:// in prod (browser blocks ws:// on https).
-    const wsUrl = import.meta.env.VITE_BACKEND_WS_URL || "ws://localhost:8080/events";
-    pushLog("sys", `connecting to backend ${wsUrl}…`);
+    // Auth token (if set) goes as a query param — browser WebSocket API
+    // doesn't support custom headers.
+    const baseWsUrl = import.meta.env.VITE_BACKEND_WS_URL || "ws://localhost:8080/events";
+    const wsUrl = baseWsUrl + backendClient.wsAuthSuffix();
+    pushLog("sys", `connecting to backend ${baseWsUrl}…`);
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
 
@@ -644,9 +659,60 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [signalSource]);
 
+  // ────────────────────── Remote engine polling ────────────────────────────
+  // In remote mode, the dashboard becomes a thin viewer. Poll /state every
+  // second and overwrite local state from the backend snapshot. This means
+  // closing the browser doesn't stop trading.
+  //
+  // The local tick loop (below) early-returns when engineMode === "remote",
+  // so there's no double-execution.
+  useEffect(() => {
+    if (engineMode !== "remote") {
+      setRemoteEngineHealthy(false);
+      return;
+    }
+
+    let cancelled = false;
+    const poll = async () => {
+      const state = await backendClient.fetchState();
+      if (cancelled) return;
+      if (!state) {
+        setRemoteEngineHealthy(false);
+        return;
+      }
+      setRemoteEngineHealthy(true);
+      setRunning(state.running);
+      setStartBalance(state.start_balance);
+      setCash(state.cash);
+      // Backend uses snake_case; reshape to the frontend's camelCase
+      setPositions(state.positions.map((p) => ({
+        id: p.id, chain: p.chain, symbol: p.symbol, address: p.address,
+        qty: p.qty, entryPx: p.entry_px, markPx: p.mark_px,
+        bias: p.bias, tpPct: p.tp_pct, slPct: p.sl_pct,
+        openedAt: p.opened_at, stale: false,
+      })));
+      setTrades(state.trades.map((t) => ({
+        id: t.id, chain: t.chain, symbol: t.symbol, address: t.address,
+        qty: t.qty, entryPx: t.entry_px, exitPx: t.exit_px,
+        pnlUsd: t.pnl_usd, pnlPct: t.pnl_pct, reason: t.reason,
+        openedAt: t.opened_at, closedAt: t.closed_at,
+      })));
+      setEquity(state.equity);
+      // Params: merge so we don't blow away local-only fields (none today,
+      // but defensive against future drift).
+      setParams((prev) => ({ ...prev, ...state.params }));
+    };
+
+    poll();  // immediate first read
+    const id = setInterval(poll, 1000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [engineMode]);
+
   // ───────────────────────── Main simulation loop ──────────────────────────
   useEffect(() => {
     if (!running) return;
+    // In remote mode, the backend runs the engine. Skip the local loop.
+    if (engineMode === "remote") return;
 
     const interval = setInterval(() => {
       // 1. drift open positions' marks. Clears `stale` if it was set
@@ -736,7 +802,7 @@ export default function App() {
     }, 700);
 
     return () => clearInterval(interval);
-  }, [running, params, signalSource, enabledChains]);
+  }, [running, params, signalSource, enabledChains, engineMode]);
 
   // ────────────────────────── Visibility recovery ─────────────────────────
   // When the OS locks the screen or the user switches to another tab for
@@ -882,9 +948,36 @@ export default function App() {
   );
 
   // Controls
-  const handleStart = () => { setRunning(true); pushLog("sys", "bot started — listening for scanner events"); };
-  const handleStop  = () => { setRunning(false); pushLog("sys", "bot stopped"); };
+  const handleStart = () => {
+    if (engineMode === "remote") {
+      backendClient.controlEngine("start").then((r) => {
+        if (r.ok) pushLog("sys", "remote engine started");
+        else pushLog("sys", `✗ remote start failed: ${r.error || r.status}`);
+      });
+      return;
+    }
+    setRunning(true);
+    pushLog("sys", "bot started — listening for scanner events");
+  };
+  const handleStop = () => {
+    if (engineMode === "remote") {
+      backendClient.controlEngine("stop").then((r) => {
+        if (r.ok) pushLog("sys", "remote engine stopped");
+        else pushLog("sys", `✗ remote stop failed: ${r.error || r.status}`);
+      });
+      return;
+    }
+    setRunning(false);
+    pushLog("sys", "bot stopped");
+  };
   const handleReset = () => {
+    if (engineMode === "remote") {
+      backendClient.controlEngine("reset").then((r) => {
+        if (r.ok) pushLog("sys", "remote engine reset");
+        else pushLog("sys", `✗ remote reset failed: ${r.error || r.status}`);
+      });
+      return;
+    }
     setRunning(false);
     setCash(startBalance);
     setPositions([]);
@@ -893,14 +986,26 @@ export default function App() {
     setEquity([{ t: 0, v: startBalance }]);
     setTickCount(0);
     setLogs([]);
-    // Reset the dedup ref so future trades push fresh, and wipe Supabase
-    // tables so a fresh session doesn't accumulate stale rows.
     pushedTradeIdsRef.current = new Set();
     if (persistence.isConfigured) {
       persistence.clearAll().catch(() => {});
     }
     pushLog("sys", `harness reset — wallet refilled to ${fmtUsd(startBalance)}${persistence.isConfigured ? " · supabase cleared" : ""}`);
   };
+
+  // When params change in remote mode, push the update to the backend.
+  // Debounced so a slider drag doesn't fire 50 requests.
+  const paramsPushTimerRef = useRef(null);
+  useEffect(() => {
+    if (engineMode !== "remote") return;
+    if (paramsPushTimerRef.current) clearTimeout(paramsPushTimerRef.current);
+    paramsPushTimerRef.current = setTimeout(() => {
+      backendClient.updateParams({ ...params, start_balance: startBalance });
+    }, 400);
+    return () => {
+      if (paramsPushTimerRef.current) clearTimeout(paramsPushTimerRef.current);
+    };
+  }, [engineMode, params, startBalance]);
 
   const pendingCount = signals.filter((s) => s.status === "pending").length;
 
@@ -928,6 +1033,20 @@ export default function App() {
               <button onClick={() => setSignalSource("live")} disabled={running}
                 className={`px-2 py-1 text-[9px] uppercase tracking-[0.2em] transition-colors disabled:opacity-50 ${signalSource === "live" ? "bg-zinc-800 text-zinc-100" : "text-zinc-500 hover:bg-zinc-900"}`}>
                 live
+              </button>
+            </div>
+
+            {/* Engine mode: local (browser tick loop) vs remote (backend runs 24/7).
+                Disabled while running so we don't lose state mid-session. */}
+            <div className="hidden items-center gap-1 border border-zinc-800 md:flex"
+                 title="engine: local = browser tick loop · remote = backend keeps running with browser closed">
+              <button onClick={() => setEngineMode("local")} disabled={running}
+                className={`px-2 py-1 text-[9px] uppercase tracking-[0.2em] transition-colors disabled:opacity-50 ${engineMode === "local" ? "bg-zinc-800 text-zinc-100" : "text-zinc-500 hover:bg-zinc-900"}`}>
+                local
+              </button>
+              <button onClick={() => setEngineMode("remote")} disabled={running}
+                className={`px-2 py-1 text-[9px] uppercase tracking-[0.2em] transition-colors disabled:opacity-50 ${engineMode === "remote" ? `${remoteEngineHealthy ? "bg-emerald-900/40 text-emerald-300" : "bg-amber-900/30 text-amber-300"}` : "text-zinc-500 hover:bg-zinc-900"}`}>
+                remote{engineMode === "remote" && !remoteEngineHealthy ? " ⚠" : ""}
               </button>
             </div>
 

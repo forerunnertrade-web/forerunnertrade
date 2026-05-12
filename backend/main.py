@@ -12,6 +12,13 @@ Two-phase design rationale:
 """
 from __future__ import annotations
 
+# Load .env BEFORE any other imports. Several modules (auth.py, config.py,
+# etc.) read env vars at import time, so dotenv must be applied first or
+# those reads see the unconfigured environment. config.py also calls
+# load_dotenv() but by then it's too late for early-binding consumers.
+from dotenv import load_dotenv
+load_dotenv()
+
 import asyncio
 import logging
 import os
@@ -125,6 +132,7 @@ async def _enrich_and_broadcast_evm(rpc_url: str, event: PoolEvent) -> None:
 
         _log_metrics("EVM", event, metrics)
         await broadcast_metrics(event, metrics)
+        await _feed_engine(event, metrics)
 
 
 async def _enrich_and_broadcast_solana(rpc_url: str, event: PoolEvent) -> None:
@@ -139,6 +147,36 @@ async def _enrich_and_broadcast_solana(rpc_url: str, event: PoolEvent) -> None:
 
         _log_metrics("SOL", event, metrics)
         await broadcast_metrics(event, metrics)
+        await _feed_engine(event, metrics)
+
+
+async def _feed_engine(event: PoolEvent, metrics) -> None:
+    """Hand off a fully-enriched signal to the simulation engine.
+    Only fires when the metrics succeed (no error). Audit-only signals
+    (SOL/SUI with `error` set) don't have prices to trade off, so they're
+    skipped — they still appear in the dashboard via the WS broadcast."""
+    if metrics.error:
+        return
+    from engine import engine
+    # Reach into the audit cache for this event's score. The audit ran
+    # before enrichment in the on_pool handler — we'd ideally pass it
+    # through, but the simplest fix is to re-derive from the event's
+    # stored audit_score (set during dispatch). For now, accept a
+    # missing score as 100 (already passed AUDIT_MIN_SCORE filter to
+    # have gotten here).
+    audit_score = getattr(event, "audit_score", 100) or 100
+    await engine.add_signal({
+        "chain": event.chain.upper()[:4],
+        "symbol": getattr(event, "symbol", None) or event.pool_address[:8],
+        "address": getattr(event, "token0", None),
+        "pool_address": event.pool_address,
+        "audit_score": audit_score,
+        "liq_usd": metrics.final_liq_usd or metrics.initial_liq_usd,
+        "unique_buyers": metrics.unique_buyers,
+        "price_change_pct": metrics.price_change_pct,
+        "final_price_usd": metrics.final_price_usd,
+        "breakout_triggered": metrics.breakout_triggered,
+    })
 
 
 def _log_metrics(tag: str, event: PoolEvent, metrics) -> None:

@@ -16,8 +16,10 @@ from dataclasses import asdict
 from typing import Set
 
 import httpx
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+
+from auth import auth_is_enabled, require_auth, require_ws_auth
 
 from auditor import AuditResult
 from scanners.base import PoolEvent
@@ -194,7 +196,7 @@ app.add_middleware(
 
 
 @app.post("/tv-webhook")
-async def tradingview_webhook(req: Request):
+async def tradingview_webhook(req: Request, _: None = Depends(require_auth)):
     try:
         payload = await req.json()
     except Exception:
@@ -215,13 +217,85 @@ async def tradingview_webhook(req: Request):
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "clients": len(_clients)}
+    """Open endpoint — Railway healthcheck hits this without auth.
+    Returns minimal info so it can't be used to enumerate state."""
+    return {"ok": True, "clients": len(_clients), "auth": auth_is_enabled()}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Engine control + state endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+# These are the "remote control" surface the dashboard uses to drive the
+# backend simulation engine. Auth-protected so a random visitor can't
+# start/stop your bot or read your account state.
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get("/state")
+async def get_state(_: None = Depends(require_auth)):
+    """Snapshot of engine state. Dashboard polls this every 1-2 seconds."""
+    from engine import engine
+    snap = await engine.snapshot()
+    return {
+        "running": snap.running,
+        "start_balance": snap.start_balance,
+        "cash": snap.cash,
+        "positions": snap.positions,
+        "trades": snap.trades,
+        "equity": snap.equity,
+        "params": snap.params,
+        "pending_signals": snap.pending_signals,
+        "tick_count": snap.tick_count,
+        "last_tick_at": snap.last_tick_at,
+    }
+
+
+@app.post("/params")
+async def update_params(req: Request, _: None = Depends(require_auth)):
+    """Frontend pushes strategy param updates here. Merges over current."""
+    from engine import engine
+    try:
+        body = await req.json()
+    except Exception:
+        return {"ok": False, "error": "invalid json"}
+    if not isinstance(body, dict):
+        return {"ok": False, "error": "body must be an object"}
+
+    # Optional: separate field for start_balance — frontend wants to adjust
+    # this independently of strategy params.
+    if "start_balance" in body:
+        await engine.set_start_balance(body.pop("start_balance"))
+
+    if body:
+        await engine.set_params(body)
+    return {"ok": True}
+
+
+@app.post("/control")
+async def control(req: Request, _: None = Depends(require_auth)):
+    """{"action": "start" | "stop" | "reset"}"""
+    from engine import engine
+    try:
+        body = await req.json()
+    except Exception:
+        return {"ok": False, "error": "invalid json"}
+    action = (body or {}).get("action", "").lower()
+    if action == "start":
+        await engine.start()
+    elif action == "stop":
+        await engine.stop()
+    elif action == "reset":
+        await engine.reset()
+    else:
+        return {"ok": False, "error": f"unknown action: {action!r}"}
+    return {"ok": True, "action": action}
 
 
 @app.websocket("/events")
 async def events_socket(ws: WebSocket):
     """Dashboard connects here and receives every audited pool event in real
     time. Server-push only — client messages are ignored."""
+    if not await require_ws_auth(ws):
+        return  # connection already closed by the auth check
     await ws.accept()
     async with _clients_lock:
         _clients.add(ws)
