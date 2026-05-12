@@ -40,14 +40,11 @@ logging.basicConfig(
 )
 log = logging.getLogger("main")
 
- HEAD
-
 # API_HOST default: 0.0.0.0 binds to all interfaces, which is what Railway,
 # Docker, and most PaaS environments need to reach the process from outside
 # the container. For local development this is also fine — your firewall
 # is the gatekeeper. Override to "127.0.0.1" via env var if you specifically
 # want loopback-only binding on a multi-user machine.
- 42bd8c8 (Default API_HOST to 0.0.0.0 for Railway compatibility)
 API_HOST = os.getenv("API_HOST", "0.0.0.0")
 # Railway and most PaaS providers inject $PORT for the container to bind.
 # Fall back to API_PORT (our local convention) then 8080 (the default).
