@@ -452,48 +452,13 @@ export default function App() {
 
   // ─── Supabase write-through ──────────────────────────────────────────────
   // Mirrors localStorage saves to Supabase. Each effect waits for
-  // hydration so we don't overwrite cloud state with stale defaults
-  // during the brief window between mount and hydration completion.
-  useEffect(() => {
-    if (!supabaseHydrated || !persistence.isConfigured) return;
-    persistence.saveSettings({ startBalance, cash, params });
-  }, [supabaseHydrated, startBalance, cash, params]);
-
-  useEffect(() => {
-    if (!supabaseHydrated || !persistence.isConfigured) return;
-    persistence.syncPositions(positions);
-  }, [supabaseHydrated, positions]);
-
-  // Trades are append-only — write each new one individually to avoid
-  // re-uploading the whole history on every change. A ref tracks IDs
-  // we've already pushed.
-  const pushedTradeIdsRef = useRef(new Set());
-  useEffect(() => {
-    if (!supabaseHydrated || !persistence.isConfigured) return;
-    trades.forEach((t) => {
-      if (!pushedTradeIdsRef.current.has(t.id)) {
-        pushedTradeIdsRef.current.add(t.id);
-        persistence.insertTrade(t);
-      }
-    });
-  }, [supabaseHydrated, trades]);
-
-  // Equity throttled inside persistence module (5s minimum interval)
-  useEffect(() => {
-    if (!supabaseHydrated || !persistence.isConfigured) return;
-    const last = equity[equity.length - 1];
-    if (last) persistence.appendEquityPoint(last.t, last.v);
-  }, [supabaseHydrated, equity]);
-
-  const [signals, setSignals] = useState([]);
-  const [logs, setLogs] = useState([]);
-  const [trending, setTrending] = useState([]);  // DEXScreener-sourced tokens
-
-  const [signalSource, setSignalSource] = useState("synthetic");
-  const [enabledChains, setEnabledChains] = useState(["ETH", "SOL", "SUI"]);
   // Engine mode: "local" runs the React tick loop (legacy/synthetic-friendly);
   // "remote" hands control to the backend engine (runs 24/7 even with no
   // dashboard open). Default to local so existing users aren't surprised.
+  //
+  // Declared BEFORE the persistence write-through effects below so they
+  // can gate on it — in remote mode the backend is the authoritative
+  // Supabase writer, so client-side writes would create double-writes.
   const [engineMode, setEngineMode] = useState(() => {
     try { return localStorage.getItem("forerunner.engineMode") || "local"; }
     catch (_) { return "local"; }
@@ -502,6 +467,56 @@ export default function App() {
     try { localStorage.setItem("forerunner.engineMode", engineMode); } catch (_) {}
   }, [engineMode]);
   const [remoteEngineHealthy, setRemoteEngineHealthy] = useState(false);
+
+  // ─── Supabase write-through (LOCAL ENGINE ONLY) ──────────────────────────
+  // In remote mode the backend writes to Supabase directly via db.py. If we
+  // also write from here, we'd double-write and potentially clobber backend
+  // state (the frontend's view of "trades" is a downsampled snapshot, not
+  // the source of truth in remote mode).
+  //
+  // Each effect waits for hydration so we don't overwrite cloud state with
+  // stale defaults during the brief window between mount and hydration.
+  useEffect(() => {
+    if (engineMode === "remote") return;
+    if (!supabaseHydrated || !persistence.isConfigured) return;
+    persistence.saveSettings({ startBalance, cash, params });
+  }, [engineMode, supabaseHydrated, startBalance, cash, params]);
+
+  useEffect(() => {
+    if (engineMode === "remote") return;
+    if (!supabaseHydrated || !persistence.isConfigured) return;
+    persistence.syncPositions(positions);
+  }, [engineMode, supabaseHydrated, positions]);
+
+  // Trades are append-only — write each new one individually to avoid
+  // re-uploading the whole history on every change. A ref tracks IDs
+  // we've already pushed.
+  const pushedTradeIdsRef = useRef(new Set());
+  useEffect(() => {
+    if (engineMode === "remote") return;
+    if (!supabaseHydrated || !persistence.isConfigured) return;
+    trades.forEach((t) => {
+      if (!pushedTradeIdsRef.current.has(t.id)) {
+        pushedTradeIdsRef.current.add(t.id);
+        persistence.insertTrade(t);
+      }
+    });
+  }, [engineMode, supabaseHydrated, trades]);
+
+  // Equity throttled inside persistence module (5s minimum interval)
+  useEffect(() => {
+    if (engineMode === "remote") return;
+    if (!supabaseHydrated || !persistence.isConfigured) return;
+    const last = equity[equity.length - 1];
+    if (last) persistence.appendEquityPoint(last.t, last.v);
+  }, [engineMode, supabaseHydrated, equity]);
+
+  const [signals, setSignals] = useState([]);
+  const [logs, setLogs] = useState([]);
+  const [trending, setTrending] = useState([]);  // DEXScreener-sourced tokens
+
+  const [signalSource, setSignalSource] = useState("synthetic");
+  const [enabledChains, setEnabledChains] = useState(["ETH", "SOL", "SUI"]);
   const [wsStatus, setWsStatus] = useState("disconnected");
   const wsRef = useRef(null);
   const liveSignalQueueRef = useRef([]);

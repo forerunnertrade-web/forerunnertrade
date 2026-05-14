@@ -147,6 +147,70 @@ class SimulationEngine:
         self._next_id += 1
         return n
 
+    # ─── Hydration ────────────────────────────────────────────────────────────
+    async def hydrate(self) -> None:
+        """Load persisted state from Supabase on startup. Safe to call
+        even if db isn't configured — it'll no-op. Idempotent."""
+        import db
+        if not db.is_configured():
+            log.info("Engine hydration skipped: Supabase not configured")
+            return
+        log.info("Hydrating engine state from Supabase…")
+        try:
+            settings = await db.load_settings()
+            trades = await db.load_trades(limit=200)
+            positions = await db.load_positions()
+            equity = await db.load_equity(limit=500)
+
+            async with self._lock:
+                if settings:
+                    self.start_balance = settings["start_balance"]
+                    self.cash = settings["cash"]
+                    if settings["params"]:
+                        self.params.update(settings["params"])
+
+                # Convert DB rows back to Position dataclasses
+                self.positions = {}
+                for p in positions:
+                    pos = Position(
+                        id=p["id"], chain=p["chain"], symbol=p["symbol"],
+                        address=p.get("address"), qty=p["qty"],
+                        entry_px=p["entry_px"], mark_px=p["mark_px"],
+                        bias=p["bias"], tp_pct=p["tp_pct"], sl_pct=p["sl_pct"],
+                        opened_at=p["opened_at"],
+                    )
+                    self.positions[pos.id] = pos
+                    # Keep _next_id ahead of all restored IDs
+                    if pos.id >= self._next_id:
+                        self._next_id = pos.id + 1
+
+                # Same for trades
+                self.trades = []
+                for t in trades:
+                    trade = Trade(
+                        id=t["id"], chain=t["chain"], symbol=t["symbol"],
+                        address=t.get("address"), qty=t["qty"],
+                        entry_px=t["entry_px"], exit_px=t["exit_px"],
+                        pnl_usd=t["pnl_usd"], pnl_pct=t["pnl_pct"],
+                        reason=t["reason"],
+                        opened_at=t["opened_at"], closed_at=t["closed_at"],
+                    )
+                    self.trades.append(trade)
+                    if trade.id >= self._next_id:
+                        self._next_id = trade.id + 1
+
+                if equity:
+                    self.equity = equity
+                    # Resume tick counter from where we left off
+                    self.tick_count = equity[-1]["t"]
+
+            log.info(
+                "Hydrated: %d positions, %d trades, %d equity points, cash=$%.2f",
+                len(self.positions), len(self.trades), len(self.equity), self.cash
+            )
+        except Exception:
+            log.exception("Engine hydration failed; starting fresh")
+
     # ─── Public API ──────────────────────────────────────────────────────────
     async def start(self) -> None:
         async with self._lock:
@@ -183,6 +247,14 @@ class SimulationEngine:
             while not self._signals.empty():
                 try: self._signals.get_nowait()
                 except asyncio.QueueEmpty: break
+            params_copy = dict(self.params)
+            sb = self.start_balance
+            cash = self.cash
+        # DB writes outside the lock — clear_all + fresh settings row
+        import db
+        if db.is_configured():
+            await db.clear_all()
+            await db.save_settings(sb, cash, params_copy)
         log.info("Engine reset")
 
     async def set_params(self, new_params: dict) -> None:
@@ -190,6 +262,9 @@ class SimulationEngine:
         async with self._lock:
             self.params.update(new_params)
             log.info("Params updated: %s", {k: new_params[k] for k in new_params})
+            snapshot = (self.start_balance, self.cash, dict(self.params))
+        # Persist outside the lock
+        await self._save_settings_safe(*snapshot)
 
     async def set_start_balance(self, amount: float) -> None:
         async with self._lock:
@@ -197,6 +272,18 @@ class SimulationEngine:
             # If we haven't opened any positions yet, sync cash too
             if not self.positions and not self.trades:
                 self.cash = self.start_balance
+            snapshot = (self.start_balance, self.cash, dict(self.params))
+        await self._save_settings_safe(*snapshot)
+
+    async def _save_settings_safe(self, start_balance: float, cash: float, params: dict) -> None:
+        """Fire-and-forget settings persist; never raises."""
+        import db
+        if not db.is_configured():
+            return
+        try:
+            await db.save_settings(start_balance, cash, params)
+        except Exception:
+            log.exception("save_settings failed")
 
     async def add_signal(self, signal: dict) -> None:
         """Called by the scanner pipeline when an audited+enriched pool
@@ -256,6 +343,12 @@ class SimulationEngine:
                 drift = random.uniform(-0.04, 0.05) + pos.bias
                 pos.mark_px = max(1e-9, pos.mark_px * (1 + drift))
 
+            # Track what changed so we can flush to DB after the lock releases.
+            # Trades and positions are the "expensive" writes; equity is
+            # throttled inside db.append_equity_point.
+            closed_trades: list[Trade] = []
+            position_set_dirty = False
+
             # ── 2. Close positions hitting TP/SL/timeout ────────────────────
             close_age_ms = 45_000
             to_close: list[tuple[int, str]] = []
@@ -283,6 +376,8 @@ class SimulationEngine:
                     opened_at=pos.opened_at, closed_at=now_ms,
                 )
                 self.trades.insert(0, trade)
+                closed_trades.append(trade)
+                position_set_dirty = True
                 # Cap memory
                 if len(self.trades) > TRADE_CAP:
                     self.trades = self.trades[:TRADE_CAP]
@@ -320,6 +415,7 @@ class SimulationEngine:
                         )
                         self.positions[pos.id] = pos
                         self.cash -= self.params["positionSizeUsd"]
+                        position_set_dirty = True
                         log.info(
                             "OPEN %s %s qty=%.4f @ $%.6g",
                             pos.chain, pos.symbol, qty, entry_px
@@ -332,6 +428,62 @@ class SimulationEngine:
             if len(self.equity) > EQUITY_CAP:
                 # Drop oldest to keep bounded
                 self.equity = self.equity[-EQUITY_CAP:]
+
+            # Snapshots used by post-lock flush
+            sb_snap = self.start_balance
+            cash_snap = self.cash
+            params_snap = dict(self.params)
+            tick_t = self.tick_count
+            equity_v = total_equity
+            positions_snap = [self._position_to_dict(p) for p in self.positions.values()] if position_set_dirty else None
+
+        # ── 5. Flush to DB OUTSIDE the lock ─────────────────────────────────
+        # Fire-and-forget: DB latency must not throttle the tick rate.
+        # Each task catches its own exceptions; no failure here can break
+        # the loop.
+        import db
+        if db.is_configured():
+            # Trades: one insert per closed trade
+            for trade in closed_trades:
+                asyncio.create_task(self._safe_insert_trade(trade.to_dict()))
+            # Positions: only re-sync if the set changed
+            if positions_snap is not None:
+                asyncio.create_task(self._safe_sync_positions(positions_snap))
+            # Settings: cash changed if we opened or closed
+            if closed_trades or position_set_dirty:
+                asyncio.create_task(self._save_settings_safe(sb_snap, cash_snap, params_snap))
+            # Equity: throttled inside db module to ~once per 5s
+            asyncio.create_task(self._safe_append_equity(tick_t, equity_v))
+
+    @staticmethod
+    def _position_to_dict(p: "Position") -> dict:
+        return {
+            "id": p.id, "chain": p.chain, "symbol": p.symbol, "address": p.address,
+            "qty": p.qty, "entry_px": p.entry_px, "mark_px": p.mark_px,
+            "bias": p.bias, "tp_pct": p.tp_pct, "sl_pct": p.sl_pct,
+            "opened_at": p.opened_at,
+        }
+
+    async def _safe_insert_trade(self, trade_dict: dict) -> None:
+        import db
+        try:
+            await db.insert_trade(trade_dict)
+        except Exception:
+            log.exception("insert_trade failed")
+
+    async def _safe_sync_positions(self, positions: list[dict]) -> None:
+        import db
+        try:
+            await db.sync_positions(positions)
+        except Exception:
+            log.exception("sync_positions failed")
+
+    async def _safe_append_equity(self, t: int, v: float) -> None:
+        import db
+        try:
+            await db.append_equity_point(t, v)
+        except Exception:
+            log.exception("append_equity_point failed")
 
     def _signal_passes(self, sig: dict) -> bool:
         """Same filter logic as frontend's strategyPasses, ported."""

@@ -222,6 +222,15 @@ async def main() -> None:
     if not scanners:
         log.warning("No scanners enabled — running API only.")
 
+    # Hydrate engine state from Supabase BEFORE starting tasks, so the API
+    # serves the right values from the first /state call. Safe no-op if
+    # Supabase isn't configured.
+    from engine import engine
+    import db
+    await engine.hydrate()
+    log.info("DB persistence: %s",
+             "enabled" if db.is_configured() else "disabled (state ephemeral)")
+
     tasks = [asyncio.create_task(s.run(), name=s.name) for s in scanners]
     tasks.append(asyncio.create_task(run_api(), name="api"))
 
