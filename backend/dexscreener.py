@@ -69,11 +69,13 @@ class TrendingToken:
     liq_usd: Optional[float] = None
     volume_24h: Optional[float] = None
     price_change_24h: Optional[float] = None
+    price_change_h1: Optional[float] = None    # 1-hour move, more relevant for entry timing
     market_cap: Optional[float] = None
     pair_address: Optional[str] = None
     pair_url: Optional[str] = None
-    boost_amount: Optional[int] = None  # # of boosts active
-    first_seen_at: float = 0.0          # epoch seconds when WE first saw it
+    pair_created_at: Optional[float] = None    # epoch ms when the pool was created
+    boost_amount: Optional[int] = None         # # of boosts active
+    first_seen_at: float = 0.0                 # epoch seconds when WE first saw it
 
 
 # Module-level dedup cache. Map of (chain, address) -> first_seen epoch.
@@ -160,6 +162,11 @@ def _enrich_with_pair(token: TrendingToken, pair: dict) -> TrendingToken:
     token.market_cap = _safe_float(pair.get("marketCap")) or token.market_cap
     token.pair_address = token.pair_address or pair.get("pairAddress")
     token.pair_url = token.pair_url or pair.get("url")
+    # pairCreatedAt is epoch ms; the field exists on most chains but
+    # occasionally null on very new pairs that DEXScreener hasn't fully
+    # indexed yet — fine, we just won't apply the recency filter.
+    token.pair_created_at = _safe_float(pair.get("pairCreatedAt")) or token.pair_created_at
+    token.price_change_h1 = _safe_float(pc.get("h1")) or token.price_change_h1
     return token
 
 

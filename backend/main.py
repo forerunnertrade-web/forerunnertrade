@@ -55,13 +55,32 @@ DEXSCREENER_ENABLED = os.getenv("DEXSCREENER_ENABLED", "true").lower() == "true"
 DEXSCREENER_INTERVAL = int(os.getenv("DEXSCREENER_INTERVAL_SECONDS", "60"))
 DEXSCREENER_CHAINS = os.getenv("DEXSCREENER_CHAINS", "ETH,SOL,BASE,BSC,POLY,ARB").split(",")
 
+# Trending-as-signal: when true, DEXScreener-trending tokens are routed
+# through the same audit pipeline as on-chain new pools, and ones that
+# pass the audit are fed into the engine. This is the "opt-in to also
+# consider already-created coins" path. Off by default because trending
+# tokens have already moved before we see them — paper P&L on these will
+# skew worse than on fresh launches.
+TRENDING_AS_SIGNAL = os.getenv("TRENDING_AS_SIGNAL", "false").lower() == "true"
+# Skip trending tokens whose pool was created more than this many hours
+# ago. Older tokens are likely established coins (WBTC, USDC, etc.) that
+# we don't want to audit-and-trade. Default 24h.
+TRENDING_MAX_AGE_HOURS = int(os.getenv("TRENDING_MAX_AGE_HOURS", "24"))
+
 # Bound the number of concurrent enrichment tasks so a launch storm can't
 # saturate our RPC budget. Each enrichment makes ~3 calls.
 _enrich_sem = asyncio.Semaphore(5)
 
 
+# Tracks (chain, address) pairs we've already pushed to the engine so
+# repeated trending updates don't spam the queue. Bounded to ~1000 entries.
+_engine_fed_keys: set[tuple[str, str]] = set()
+
+
 async def on_trending(token) -> None:
-    """Hand-off from the DEXScreener poller to the WS broadcast."""
+    """Hand-off from the DEXScreener poller. Always broadcasts to dashboards.
+    If TRENDING_AS_SIGNAL is on, also routes through audit+engine for tokens
+    young enough to be plausibly tradeable."""
     log.info(
         "Trending: %s/%s sym=%s liq=$%s vol=$%s",
         token.chain, token.address[:10],
@@ -70,6 +89,92 @@ async def on_trending(token) -> None:
         f"{token.volume_24h:,.0f}" if token.volume_24h else "?",
     )
     await broadcast_trending(token)
+
+    if not TRENDING_AS_SIGNAL:
+        return
+
+    # Recency gate. Tokens without a pair_created_at are skipped — usually
+    # established quote coins (USDC, WETH) or DEXScreener indexing lag.
+    if token.pair_created_at is None:
+        return
+    import time
+    age_hours = (time.time() * 1000 - token.pair_created_at) / 1000 / 3600
+    if age_hours > TRENDING_MAX_AGE_HOURS:
+        return
+
+    # Dedup: don't re-audit the same token every poll cycle.
+    global _engine_fed_keys
+    key = (token.chain, token.address.lower())
+    if key in _engine_fed_keys:
+        return
+    _engine_fed_keys.add(key)
+    if len(_engine_fed_keys) > 1000:
+        # Drop oldest 200 — set doesn't preserve order, so just clear half
+        _engine_fed_keys = set(list(_engine_fed_keys)[500:])
+
+    # Synthesize a PoolEvent so the existing audit pipeline can score it.
+    # We use the pair_address as pool_address (correct for EVM Uniswap V2
+    # pools and approximately right for Raydium — the auditor cares about
+    # the token mint/address, not the pool).
+    from scanners.base import PoolEvent
+    pseudo_event = PoolEvent(
+        chain=_chain_code_to_internal(token.chain),
+        dex="dexscreener-trending",
+        pool_address=token.pair_address or token.address,
+        token0=token.address,
+        token1="",  # quote side unknown from trending feed; auditor handles
+        block_or_slot=0,
+        tx_hash="",
+    )
+
+    # Run audit. Same flow as on_pool, but condensed — no enrichment task
+    # since DEXScreener already gives us the metrics (liq, volume, change).
+    try:
+        audit = await quick_audit(pseudo_event)
+    except Exception:
+        log.exception("audit failed for trending %s", token.address[:10])
+        return
+
+    if not audit.passed:
+        log.info("trending %s %s: audit FAIL — %s",
+                 token.chain, token.symbol or "?", audit.reason)
+        return
+
+    log.info(
+        "trending → engine: %s %s score=%d liq=$%s",
+        token.chain, token.symbol or "?", audit.score,
+        f"{token.liq_usd:,.0f}" if token.liq_usd else "?",
+    )
+
+    # Push directly into the engine queue, bypassing the WS broadcast for
+    # signals (the dashboard already saw this via broadcast_trending above).
+    from engine import engine
+    await engine.add_signal({
+        "chain": token.chain,
+        "symbol": token.symbol or token.address[:8],
+        "address": token.address,
+        "pool_address": token.pair_address,
+        "audit_score": audit.score,
+        "liq_usd": token.liq_usd,
+        "unique_buyers": None,        # we don't have 30s buyer counts here
+        "price_change_pct": token.price_change_h1,  # 1h move is the closest analog
+        "final_price_usd": token.price_usd,
+        "breakout_triggered": None,   # not computable from trending data
+        "source": "dexscreener-trending",
+    })
+
+
+def _chain_code_to_internal(code: str) -> str:
+    """Convert dashboard chain codes (ETH/SOL/BASE) to scanner internal names."""
+    return {
+        "ETH": "ethereum",
+        "SOL": "solana",
+        "SUI": "sui",
+        "BASE": "base",
+        "BSC": "bsc",
+        "POLY": "polygon",
+        "ARB": "arbitrum",
+    }.get(code, code.lower())
 
 
 async def on_pool(event: PoolEvent) -> None:
@@ -250,6 +355,9 @@ async def main() -> None:
              "enabled" if DEXSCREENER_ENABLED else "disabled",
              DEXSCREENER_INTERVAL,
              ",".join(DEXSCREENER_CHAINS))
+    log.info("Trending-as-signal: %s (max age=%dh)",
+             "ENABLED — trending tokens routed through engine" if TRENDING_AS_SIGNAL else "off",
+             TRENDING_MAX_AGE_HOURS)
     log.info("Dashboard WS: ws://%s:%d/events", API_HOST, API_PORT)
 
     stop = asyncio.Event()

@@ -681,9 +681,20 @@ export default function App() {
   //
   // The local tick loop (below) early-returns when engineMode === "remote",
   // so there's no double-execution.
+  //
+  // Failure handling: we don't auto-switch to local engine because that
+  // could mask real problems (Railway down, auth misconfig) AND because
+  // the two engines have different state — silently swapping them would
+  // be confusing. Instead, we track consecutive failures and show a
+  // visible warning. After N failures, log a one-time message suggesting
+  // the user toggle to local manually.
+  const consecutiveFailuresRef = useRef(0);
+  const failureWarnedRef = useRef(false);
   useEffect(() => {
     if (engineMode !== "remote") {
       setRemoteEngineHealthy(false);
+      consecutiveFailuresRef.current = 0;
+      failureWarnedRef.current = false;
       return;
     }
 
@@ -693,7 +704,24 @@ export default function App() {
       if (cancelled) return;
       if (!state) {
         setRemoteEngineHealthy(false);
+        consecutiveFailuresRef.current += 1;
+        // After 10 consecutive failures (~10s), warn once.
+        if (consecutiveFailuresRef.current === 10 && !failureWarnedRef.current) {
+          failureWarnedRef.current = true;
+          pushLog(
+            "sys",
+            "⚠ remote engine unreachable for 10s — check backend, or toggle 'local' to keep going"
+          );
+        }
         return;
+      }
+      // Recovered
+      if (consecutiveFailuresRef.current > 0) {
+        if (failureWarnedRef.current) {
+          pushLog("sys", "✓ remote engine reachable again");
+        }
+        consecutiveFailuresRef.current = 0;
+        failureWarnedRef.current = false;
       }
       setRemoteEngineHealthy(true);
       setRunning(state.running);
@@ -721,6 +749,7 @@ export default function App() {
     poll();  // immediate first read
     const id = setInterval(poll, 1000);
     return () => { cancelled = true; clearInterval(id); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [engineMode]);
 
   // ───────────────────────── Main simulation loop ──────────────────────────
