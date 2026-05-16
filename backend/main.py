@@ -116,13 +116,23 @@ async def on_trending(token) -> None:
     # We use the pair_address as pool_address (correct for EVM Uniswap V2
     # pools and approximately right for Raydium — the auditor cares about
     # the token mint/address, not the pool).
+    #
+    # quote_address is captured during the DEXScreener pair fetch — without
+    # it the auditor can't tell which side is the new token vs the
+    # established quote (WSOL/USDC/WETH), and fails with
+    # "missing token addresses".
+    if not token.quote_address:
+        # Skip silently — without the quote side we can't audit. This
+        # happens occasionally for tokens DEXScreener hasn't fully indexed.
+        return
+
     from scanners.base import PoolEvent
     pseudo_event = PoolEvent(
         chain=_chain_code_to_internal(token.chain),
         dex="dexscreener-trending",
         pool_address=token.pair_address or token.address,
         token0=token.address,
-        token1="",  # quote side unknown from trending feed; auditor handles
+        token1=token.quote_address,
         block_or_slot=0,
         tx_hash="",
     )

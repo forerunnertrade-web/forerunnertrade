@@ -62,6 +62,7 @@ class TrendingToken:
     chain: str           # uppercase code (ETH, SOL, BASE, ...)
     chain_id_raw: str    # original DEXScreener chain id
     address: str
+    quote_address: Optional[str] = None        # the OTHER side of the pair (WSOL, USDC, WETH...)
     symbol: Optional[str] = None
     name: Optional[str] = None
     icon_url: Optional[str] = None
@@ -145,9 +146,21 @@ def _safe_float(v) -> Optional[float]:
 def _enrich_with_pair(token: TrendingToken, pair: dict) -> TrendingToken:
     """Merge pair-level fields (price, liquidity, volume) into a TrendingToken."""
     base = pair.get("baseToken") or {}
+    quote = pair.get("quoteToken") or {}
     if base.get("address", "").lower() == token.address.lower():
         token.symbol = token.symbol or base.get("symbol")
         token.name = token.name or base.get("name")
+        # The OTHER side of the pair is the quote (WSOL/USDC/WETH/etc.)
+        # The auditor needs both addresses to know which one is the new
+        # token vs the established quote. Without this, audit fails with
+        # "missing token addresses".
+        token.quote_address = token.quote_address or quote.get("address")
+    elif quote.get("address", "").lower() == token.address.lower():
+        # Edge case: DEXScreener occasionally has the token on the quote side
+        # (e.g. a stablecoin-vs-newcoin pair indexed in reverse).
+        token.symbol = token.symbol or quote.get("symbol")
+        token.name = token.name or quote.get("name")
+        token.quote_address = token.quote_address or base.get("address")
 
     info = pair.get("info") or {}
     token.icon_url = token.icon_url or info.get("imageUrl")
