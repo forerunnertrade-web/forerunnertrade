@@ -225,6 +225,24 @@ async def health():
     return {"ok": True, "clients": len(_clients), "auth": auth_is_enabled()}
 
 
+@app.get("/debug/routes")
+async def debug_routes():
+    """Public diagnostic — lists every registered route. Use this to verify
+    that the deployed binary actually has the endpoints you expect. If
+    /signals etc. are missing from the output here, you're running an old
+    build, no matter what the source code says.
+
+    Example: curl https://your-backend.railway.app/debug/routes
+    """
+    routes = []
+    for r in app.routes:
+        path = getattr(r, "path", str(r))
+        methods = list(getattr(r, "methods", []) or [])
+        routes.append({"path": path, "methods": sorted(methods)})
+    routes.sort(key=lambda x: x["path"])
+    return {"routes": routes, "count": len(routes)}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Engine control + state endpoints
 # ─────────────────────────────────────────────────────────────────────────────

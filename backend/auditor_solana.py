@@ -143,10 +143,22 @@ async def audit_solana_token(rpc_url: str, mint_address: str) -> SolanaTokenChec
                     ],
                 },
             )
-            resp.raise_for_status()
+            # Capture status BEFORE raise_for_status so we can surface it
+            if resp.status_code >= 400:
+                body_preview = resp.text[:200] if resp.text else ""
+                log.warning(
+                    "Solana RPC error %d for mint %s: %s",
+                    resp.status_code, mint_address[:10], body_preview
+                )
+                return SolanaTokenChecks(
+                    error=f"http {resp.status_code}: {body_preview[:60]}"
+                )
+
             body = resp.json()
             if "error" in body:
-                return SolanaTokenChecks(error=f"RPC: {body['error']}")
+                err = body['error']
+                err_str = err.get('message', str(err)) if isinstance(err, dict) else str(err)
+                return SolanaTokenChecks(error=f"RPC: {err_str[:80]}")
 
             value = (body.get("result") or {}).get("value")
             if not value:
@@ -158,8 +170,13 @@ async def audit_solana_token(rpc_url: str, mint_address: str) -> SolanaTokenChec
 
             return _decode_mint_account(base64.b64decode(data_b64))
 
+    except httpx.TimeoutException:
+        return SolanaTokenChecks(error="rpc timeout (>8s)")
     except httpx.HTTPError as e:
-        return SolanaTokenChecks(error=f"http: {type(e).__name__}")
+        # Surface the exception class AND any inner message
+        msg = str(e)[:80] if str(e) else type(e).__name__
+        return SolanaTokenChecks(error=f"http: {type(e).__name__}: {msg}")
     except Exception as e:
-        log.debug("audit_solana_token unexpected error: %s", e)
+        log.warning("audit_solana_token unexpected error for %s: %s",
+                    mint_address[:10], e)
         return SolanaTokenChecks(error=f"{type(e).__name__}: {str(e)[:80]}")
