@@ -293,6 +293,53 @@ async def control(req: Request, _: None = Depends(require_auth)):
     return {"ok": True, "action": action}
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Observability read endpoints — for the dashboard's analysis views
+# ─────────────────────────────────────────────────────────────────────────────
+# These are paginated reads of the observability tables. The dashboard
+# uses them to render "what did we see and what did we do" history.
+# Bounded `limit` so a misbehaving client can't ask for the whole table.
+
+@app.get("/signals")
+async def get_signals(limit: int = 100, _: None = Depends(require_auth)):
+    """Most recent signals (passed and failed). Useful for retrospective
+    analysis: 'what did the scanner see at 3am yesterday?'"""
+    import db
+    if not db.is_configured():
+        return {"signals": [], "configured": False}
+    limit = max(1, min(500, limit))
+    rows = await db.load_recent_signals(limit=limit)
+    return {"signals": rows, "configured": True}
+
+
+@app.get("/trending-history")
+async def get_trending_history(limit: int = 100, _: None = Depends(require_auth)):
+    """Most recent DEXScreener trending observations."""
+    import db
+    if not db.is_configured():
+        return {"observations": [], "configured": False}
+    limit = max(1, min(500, limit))
+    rows = await db.load_recent_trending(limit=limit)
+    return {"observations": rows, "configured": True}
+
+
+@app.get("/logs")
+async def get_logs(
+    limit: int = 200,
+    category: str = "",
+    _: None = Depends(require_auth),
+):
+    """Recent system logs. Optional `?category=engine` filter narrows to
+    one category. Categories: engine, scanner, audit, dexscreener, sys."""
+    import db
+    if not db.is_configured():
+        return {"logs": [], "configured": False}
+    limit = max(1, min(500, limit))
+    cat = category.strip() or None
+    rows = await db.load_recent_logs(limit=limit, category=cat)
+    return {"logs": rows, "configured": True}
+
+
 @app.websocket("/events")
 async def events_socket(ws: WebSocket):
     """Dashboard connects here and receives every audited pool event in real
