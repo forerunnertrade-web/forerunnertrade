@@ -67,3 +67,32 @@ export async function controlEngine(action) {
 export function wsAuthSuffix() {
   return TOKEN ? `?token=${encodeURIComponent(TOKEN)}` : "";
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Observability reads — for restoring the dashboard on browser refresh.
+// All three return arrays of plain row objects (snake_case from the DB);
+// the caller is responsible for mapping into the in-memory frontend shape.
+// Each returns [] on any error or when Supabase isn't configured (the
+// backend handles that with its `configured: false` flag).
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function fetchRecentSignals(limit = 50) {
+  const r = await safeFetch(`/signals?limit=${limit}`, { headers: headers() });
+  if (!r.ok || !r.data) return [];
+  return r.data.signals || [];
+}
+
+export async function fetchRecentTrending(limit = 50) {
+  const r = await safeFetch(`/trending-history?limit=${limit}`, { headers: headers() });
+  if (!r.ok || !r.data) return [];
+  return r.data.observations || [];
+}
+
+export async function fetchRecentLogs(limit = 100, category = "") {
+  const qs = category
+    ? `?limit=${limit}&category=${encodeURIComponent(category)}`
+    : `?limit=${limit}`;
+  const r = await safeFetch(`/logs${qs}`, { headers: headers() });
+  if (!r.ok || !r.data) return [];
+  return r.data.logs || [];
+}

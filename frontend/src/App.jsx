@@ -752,6 +752,169 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [engineMode]);
 
+  // ──────────────── Observability hydration (remote mode only) ─────────────
+  // Loads recent signals / trending observations / system logs from the
+  // backend's HTTP endpoints once when remote mode activates. The point is
+  // to make refreshing the browser feel like resuming a session rather
+  // than starting from scratch — the panels populate with what the bot
+  // saw before you opened the tab, then continue updating from WS events.
+  //
+  // Runs once per mount (or once per remote-mode toggle). After this, the
+  // WS event handler takes over for live updates, with dedup by
+  // pool_address / chain+address keeping things consistent.
+  const hydratedObservabilityRef = useRef(false);
+  useEffect(() => {
+    if (engineMode !== "remote") {
+      hydratedObservabilityRef.current = false;
+      return;
+    }
+    if (hydratedObservabilityRef.current) return;
+    hydratedObservabilityRef.current = true;
+
+    let cancelled = false;
+    (async () => {
+      try {
+        // Parallel fetches — each endpoint is independent
+        const [sigRows, trendRows, logRows] = await Promise.all([
+          backendClient.fetchRecentSignals(50),
+          backendClient.fetchRecentTrending(50),
+          backendClient.fetchRecentLogs(100),
+        ]);
+        if (cancelled) return;
+
+        // ── Signals ──────────────────────────────────────────────────────
+        // Map backend DB shape → frontend signal shape. The frontend uses
+        // camelCase + a few synthetic fields; we fill in nulls for what
+        // we don't have persisted.
+        if (sigRows.length > 0) {
+          const restored = sigRows.map((s) => ({
+            id: -s.id,  // negative IDs so they don't collide with live _liveSigId
+            chain: (s.chain || "").toUpperCase().slice(0, 3),
+            dex: s.dex,
+            symbol: s.symbol || (s.token_address || "").slice(2, 8).toUpperCase(),
+            address: s.token_address,
+            poolAddress: s.pool_address,
+            price: 0,
+            ts: s.detected_at ? new Date(s.detected_at).getTime() : Date.now(),
+            // Status from persisted state: if metrics arrived, "ready"; if
+            // enrich_error, "error"; if audit failed, "error"; else "pending".
+            status: s.enrich_error
+              ? "error"
+              : (s.unique_buyers != null || s.final_liq_usd != null)
+                ? "ready"
+                : s.audit_passed === false
+                  ? "error"
+                  : "pending",
+            liqUsd: s.final_liq_usd ?? s.initial_liq_usd ?? null,
+            buyCount: s.buy_count,
+            sellCount: s.sell_count,
+            uniqueBuyers: s.unique_buyers,
+            priceChange: s.price_change_pct != null ? Number(s.price_change_pct) : null,
+            finalPriceUsd: s.final_price_usd != null ? Number(s.final_price_usd) : null,
+            breakoutTriggered: s.breakout_triggered,
+            breakoutScore: s.breakout_score,
+            breakoutReason: s.breakout_reason,
+            auditScore: s.audit_score,
+            auditReason: s.audit_reason,
+            enrichError: s.enrich_error,
+            source: s.source,  // 'scanner' | 'dexscreener-trending'
+            historical: true,  // marker so we know not to re-broadcast logs
+          }));
+          // Dedup with any signals already in state (rare since the panel
+          // typically initializes empty, but guards against races).
+          setSignals((prev) => {
+            const seen = new Set(prev.map((s) => s.poolAddress).filter(Boolean));
+            const fresh = restored.filter((s) => !seen.has(s.poolAddress));
+            return [...prev, ...fresh].slice(0, 50);
+          });
+        }
+
+        // ── Trending observations ────────────────────────────────────────
+        // The trending panel already dedups by chain+address, so we can
+        // just feed the rows in. Backend stores price_change_24h as
+        // numeric — frontend expects Number.
+        if (trendRows.length > 0) {
+          const restored = trendRows.map((t) => ({
+            chain: t.chain,
+            address: t.address,
+            symbol: t.symbol,
+            name: t.name,
+            price_usd: t.price_usd != null ? Number(t.price_usd) : null,
+            liq_usd: t.liq_usd != null ? Number(t.liq_usd) : null,
+            volume_24h: t.volume_24h != null ? Number(t.volume_24h) : null,
+            price_change_24h: t.price_change_24h != null ? Number(t.price_change_24h) : null,
+            price_change_h1: t.price_change_h1 != null ? Number(t.price_change_h1) : null,
+            market_cap: t.market_cap != null ? Number(t.market_cap) : null,
+            pair_address: t.pair_address,
+            pair_url: t.pair_url,
+            pair_created_at: t.pair_created_at ? new Date(t.pair_created_at).getTime() : null,
+            boost_amount: t.boost_amount,
+            ts: t.observed_at ? new Date(t.observed_at).getTime() : Date.now(),
+            historical: true,
+          }));
+          setTrending((prev) => {
+            const seen = new Set(
+              prev.map((t) => `${t.chain}:${(t.address || "").toLowerCase()}`)
+            );
+            const fresh = restored.filter(
+              (t) => !seen.has(`${t.chain}:${(t.address || "").toLowerCase()}`)
+            );
+            return [...prev, ...fresh].slice(0, 30);
+          });
+        }
+
+        // ── System logs ──────────────────────────────────────────────────
+        // The logs panel is most recent at top. Backend returns desc order;
+        // we map level+category+message to the {kind, text, ts} shape the
+        // log panel expects.
+        if (logRows.length > 0) {
+          const restored = logRows.map((row) => ({
+            id: row.id,
+            kind: row.category || "sys",
+            text: row.message || "",
+            ts: row.recorded_at ? new Date(row.recorded_at).getTime() : Date.now(),
+            level: row.level,
+            historical: true,
+          }));
+          setLogs((prev) => {
+            // Avoid double-adding if user has logs in this session already.
+            // Logs aren't naturally dedup-able by ID across sources, so the
+            // simple approach: only restore if current logs are empty or
+            // near-empty (just the initial "harness ready" line).
+            if (prev.length > 5) return prev;
+            return [...prev, ...restored];
+          });
+        }
+      } catch (err) {
+        console.warn("observability hydration failed:", err);
+      }
+    })();
+
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [engineMode]);
+
+  // ─── Remote-mode WS signal pump ──────────────────────────────────────────
+  // In remote mode the local tick loop doesn't run, so we need a separate
+  // drainer that pulls incoming WS pool_event signals into the signals
+  // panel. Dedups by pool_address so a hydrated signal isn't duplicated.
+  useEffect(() => {
+    if (engineMode !== "remote") return;
+    if (signalSource !== "live") return;
+
+    const id = setInterval(() => {
+      if (liveSignalQueueRef.current.length === 0) return;
+      const incoming = liveSignalQueueRef.current.splice(0, liveSignalQueueRef.current.length);
+      setSignals((prev) => {
+        const seen = new Set(prev.map((s) => s.poolAddress).filter(Boolean));
+        const fresh = incoming.filter((s) => !seen.has(s.poolAddress));
+        if (fresh.length === 0) return prev;
+        return [...fresh.reverse(), ...prev].slice(0, 50);
+      });
+    }, 500);
+    return () => clearInterval(id);
+  }, [engineMode, signalSource]);
+
   // ───────────────────────── Main simulation loop ──────────────────────────
   useEffect(() => {
     if (!running) return;
