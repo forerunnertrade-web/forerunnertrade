@@ -256,6 +256,8 @@ async def sync_positions(positions: list[dict]) -> bool:
         "tp_pct": p["tp_pct"],
         "sl_pct": p["sl_pct"],
         "opened_at": _epoch_ms_to_iso(p["opened_at"]),
+        "pool_address": p.get("pool_address"),
+        "quote_address": p.get("quote_address"),
     } for p in positions]
 
     resp = await _request(
@@ -293,6 +295,8 @@ def _position_row_to_engine_shape(r: dict) -> dict:
         "tp_pct": float(r["tp_pct"]),
         "sl_pct": float(r["sl_pct"]),
         "opened_at": _iso_to_epoch_ms(r["opened_at"]),
+        "pool_address": r.get("pool_address"),
+        "quote_address": r.get("quote_address"),
     }
 
 
@@ -374,3 +378,220 @@ def _iso_to_epoch_ms(iso: str) -> float:
     # or "2024-05-12T15:20:00+00:00". datetime.fromisoformat handles both
     # on Python 3.11+.
     return datetime.fromisoformat(iso).timestamp() * 1000.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Signals — Phase 1 INSERT on detection, Phase 2 UPDATE on enrichment
+# ─────────────────────────────────────────────────────────────────────────────
+async def upsert_signal_phase1(
+    *, source: str, chain: str, dex: str, pool_address: str,
+    token_address: str, quote_address: Optional[str],
+    symbol: Optional[str],
+    audit_passed: bool, audit_score: int, audit_reason: str,
+) -> bool:
+    """Record the audit phase. Idempotent on (user, chain, pool_address) —
+    if the same pool is detected twice, the second call is a no-op rather
+    than creating a duplicate row."""
+    row = {
+        "user_id": DEFAULT_USER_ID,
+        "source": source,
+        "chain": chain,
+        "dex": dex,
+        "pool_address": pool_address,
+        "token_address": token_address,
+        "quote_address": quote_address,
+        "symbol": symbol,
+        "audit_passed": audit_passed,
+        "audit_score": audit_score,
+        "audit_reason": audit_reason,
+    }
+    resp = await _request(
+        "POST", "/signals",
+        json=row,
+        headers={"Prefer": "resolution=ignore-duplicates"},
+    )
+    return resp is not None
+
+
+async def update_signal_phase2(
+    *, chain: str, pool_address: str, metrics: dict,
+) -> bool:
+    """Update an existing signal row with enrichment metrics. Fails silently
+    if no matching row exists (could happen if Phase 1 write failed)."""
+    row = {
+        "initial_liq_usd": metrics.get("initial_liq_usd"),
+        "final_liq_usd": metrics.get("final_liq_usd"),
+        "buy_count": metrics.get("buy_count"),
+        "sell_count": metrics.get("sell_count"),
+        "unique_buyers": metrics.get("unique_buyers"),
+        "price_change_pct": metrics.get("price_change_pct"),
+        "final_price_usd": metrics.get("final_price_usd"),
+        "breakout_triggered": metrics.get("breakout_triggered"),
+        "breakout_score": metrics.get("breakout_score"),
+        "breakout_reason": metrics.get("breakout_reason"),
+        "enrich_error": metrics.get("error"),
+        "enriched_at": _now_iso(),
+    }
+    # Strip None values so we don't overwrite Phase 1 data with nulls
+    row = {k: v for k, v in row.items() if v is not None}
+    if not row:
+        return True
+
+    resp = await _request(
+        "PATCH", "/signals",
+        json=row,
+        params={
+            "user_id": f"eq.{DEFAULT_USER_ID}",
+            "chain": f"eq.{chain}",
+            "pool_address": f"eq.{pool_address}",
+        },
+    )
+    return resp is not None
+
+
+async def mark_signal_acted_on(*, chain: str, pool_address: str, position_id: int) -> bool:
+    """Set acted_on=true on a signal when the engine opens a position from it."""
+    resp = await _request(
+        "PATCH", "/signals",
+        json={"acted_on": True, "acted_position_id": position_id},
+        params={
+            "user_id": f"eq.{DEFAULT_USER_ID}",
+            "chain": f"eq.{chain}",
+            "pool_address": f"eq.{pool_address}",
+        },
+    )
+    return resp is not None
+
+
+async def load_recent_signals(limit: int = 100) -> list[dict]:
+    """For dashboard 'recent signals' view."""
+    resp = await _request(
+        "GET", "/signals",
+        params={
+            "user_id": f"eq.{DEFAULT_USER_ID}",
+            "select": "*",
+            "order": "detected_at.desc",
+            "limit": str(limit),
+        },
+    )
+    if resp is None:
+        return []
+    try:
+        rows = resp.json()
+        # Defensive: PostgREST should always return a list, but if config
+        # is off we might get an error dict instead. Don't crash the
+        # endpoint.
+        if not isinstance(rows, list):
+            log.warning("signals: unexpected response shape %r", type(rows).__name__)
+            return []
+        return rows
+    except Exception as e:
+        log.warning("signals JSON parse failed: %s", e)
+        return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Trending observations — append-only, write-time deduped per hour
+# ─────────────────────────────────────────────────────────────────────────────
+async def insert_trending_observation(token) -> bool:
+    """Insert one trending token observation. The schema's unique index on
+    (user, chain, address, observation_hour) means PostgREST returns 409
+    on duplicate — we use ignore-duplicates so duplicates are silently
+    dropped."""
+    pair_created = None
+    if token.pair_created_at:
+        pair_created = _epoch_ms_to_iso(token.pair_created_at)
+    row = {
+        "user_id": DEFAULT_USER_ID,
+        "chain": token.chain,
+        "address": token.address,
+        "symbol": token.symbol,
+        "name": token.name,
+        "price_usd": token.price_usd,
+        "liq_usd": token.liq_usd,
+        "volume_24h": token.volume_24h,
+        "price_change_24h": token.price_change_24h,
+        "price_change_h1": token.price_change_h1,
+        "market_cap": token.market_cap,
+        "pair_address": token.pair_address,
+        "pair_url": token.pair_url,
+        "pair_created_at": pair_created,
+        "boost_amount": token.boost_amount,
+        # Don't set observation_hour or observed_at — let DB defaults handle them
+    }
+    resp = await _request(
+        "POST", "/trending_observations",
+        json=row,
+        headers={"Prefer": "resolution=ignore-duplicates"},
+    )
+    return resp is not None
+
+
+async def load_recent_trending(limit: int = 100) -> list[dict]:
+    resp = await _request(
+        "GET", "/trending_observations",
+        params={
+            "user_id": f"eq.{DEFAULT_USER_ID}",
+            "select": "*",
+            "order": "observed_at.desc",
+            "limit": str(limit),
+        },
+    )
+    if resp is None:
+        return []
+    try:
+        rows = resp.json()
+        if not isinstance(rows, list):
+            log.warning("trending: unexpected response shape %r", type(rows).__name__)
+            return []
+        return rows
+    except Exception as e:
+        log.warning("trending JSON parse failed: %s", e)
+        return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# System logs — high write rate, write-batched in the caller
+# ─────────────────────────────────────────────────────────────────────────────
+async def insert_log_batch(entries: list[dict]) -> bool:
+    """Write a batch of log entries in one HTTP call. Caller is responsible
+    for batching to avoid hammering the DB. Each entry should have
+    'level', 'category', 'message' keys."""
+    if not entries:
+        return True
+    rows = [{
+        "user_id": DEFAULT_USER_ID,
+        "level": e.get("level", "info"),
+        "category": e.get("category", "sys"),
+        "message": e.get("message", ""),
+    } for e in entries]
+    resp = await _request("POST", "/system_logs", json=rows)
+    return resp is not None
+
+
+async def load_recent_logs(limit: int = 200, category: Optional[str] = None) -> list[dict]:
+    params = {
+        "user_id": f"eq.{DEFAULT_USER_ID}",
+        "select": "*",
+        "order": "recorded_at.desc",
+        "limit": str(limit),
+    }
+    if category:
+        params["category"] = f"eq.{category}"
+    resp = await _request("GET", "/system_logs", params=params)
+    if resp is None:
+        return []
+    try:
+        rows = resp.json()
+        if not isinstance(rows, list):
+            log.warning("logs: unexpected response shape %r", type(rows).__name__)
+            return []
+        return rows
+    except Exception as e:
+        log.warning("logs JSON parse failed: %s", e)
+        return []
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()

@@ -67,6 +67,17 @@ TRENDING_AS_SIGNAL = os.getenv("TRENDING_AS_SIGNAL", "false").lower() == "true"
 # we don't want to audit-and-trade. Default 24h.
 TRENDING_MAX_AGE_HOURS = int(os.getenv("TRENDING_MAX_AGE_HOURS", "24"))
 
+# Minimum liquidity (USD) required before we'll spend an RPC call to audit
+# a trending token. Free-tier Helius rate-limits around 10 req/s; without
+# this filter, every trending poll burns dozens of audit RPCs on microcap
+# scams. $10k cuts that to ~10-20% of the feed which fits comfortably.
+TRENDING_MIN_LIQ_USD = int(os.getenv("TRENDING_MIN_LIQ_USD", "10000"))
+
+# Engine auto-start: when true, the engine begins ticking immediately on
+# backend boot rather than waiting for a dashboard /control start click.
+# This is the "bot" behavior — Railway redeploys don't pause trading.
+ENGINE_AUTOSTART = os.getenv("ENGINE_AUTOSTART", "false").lower() == "true"
+
 # Bound the number of concurrent enrichment tasks so a launch storm can't
 # saturate our RPC budget. Each enrichment makes ~3 calls.
 _enrich_sem = asyncio.Semaphore(5)
@@ -90,6 +101,13 @@ async def on_trending(token) -> None:
     )
     await broadcast_trending(token)
 
+    # Always record the observation — even if trending-as-signal is off,
+    # this stream is independently useful for "what was trending on day X".
+    # Schema's hourly dedup keeps row count bounded.
+    import db
+    if db.is_configured():
+        asyncio.create_task(db.insert_trending_observation(token))
+
     if not TRENDING_AS_SIGNAL:
         return
 
@@ -100,6 +118,12 @@ async def on_trending(token) -> None:
     import time
     age_hours = (time.time() * 1000 - token.pair_created_at) / 1000 / 3600
     if age_hours > TRENDING_MAX_AGE_HOURS:
+        return
+
+    # Liquidity gate. Most trending tokens are microcap rugs with <$5k
+    # liquidity. Auditing them all burns through RPC quota and produces
+    # uninteresting signals. Skip below the threshold.
+    if not token.liq_usd or token.liq_usd < TRENDING_MIN_LIQ_USD:
         return
 
     # Dedup: don't re-audit the same token every poll cycle.
@@ -144,6 +168,23 @@ async def on_trending(token) -> None:
     except Exception:
         log.exception("audit failed for trending %s", token.address[:10])
         return
+
+    # Record the signal regardless of audit pass/fail — failed audits on
+    # trending tokens are the most interesting data of all ("DEXScreener
+    # surfaced this scammy token, our audit caught it").
+    if db.is_configured():
+        asyncio.create_task(db.upsert_signal_phase1(
+            source="dexscreener-trending",
+            chain=pseudo_event.chain,
+            dex="dexscreener-trending",
+            pool_address=pseudo_event.pool_address,
+            token_address=token.address,
+            quote_address=token.quote_address,
+            symbol=token.symbol,
+            audit_passed=audit.passed,
+            audit_score=audit.score,
+            audit_reason=audit.reason,
+        ))
 
     if not audit.passed:
         log.info("trending %s %s: audit FAIL — %s",
@@ -194,6 +235,25 @@ async def on_pool(event: PoolEvent) -> None:
         event.token0[:10], event.token1[:10],
     )
     audit = await quick_audit(event)
+
+    # Record the signal regardless of audit outcome. Failed signals are
+    # equally valuable for analysis — "what got filtered out and why".
+    # Fire-and-forget so DB latency doesn't slow the audit pipeline.
+    import db
+    if db.is_configured():
+        asyncio.create_task(db.upsert_signal_phase1(
+            source="scanner",
+            chain=event.chain,
+            dex=event.dex,
+            pool_address=event.pool_address,
+            token_address=event.token0,
+            quote_address=event.token1,
+            symbol=None,  # not known at this phase
+            audit_passed=audit.passed,
+            audit_score=audit.score,
+            audit_reason=audit.reason,
+        ))
+
     if not audit.passed:
         log.info("Filtered (score=%d, %s): %s",
                  audit.score, audit.reason, event.pool_address[:16])
@@ -245,6 +305,7 @@ async def _enrich_and_broadcast_evm(rpc_url: str, event: PoolEvent) -> None:
         _log_metrics("EVM", event, metrics)
         await broadcast_metrics(event, metrics)
         await _feed_engine(event, metrics)
+        await _persist_signal_phase2(event, metrics)
 
 
 async def _enrich_and_broadcast_solana(rpc_url: str, event: PoolEvent) -> None:
@@ -260,6 +321,38 @@ async def _enrich_and_broadcast_solana(rpc_url: str, event: PoolEvent) -> None:
         _log_metrics("SOL", event, metrics)
         await broadcast_metrics(event, metrics)
         await _feed_engine(event, metrics)
+        await _persist_signal_phase2(event, metrics)
+
+
+async def _persist_signal_phase2(event: PoolEvent, metrics) -> None:
+    """Update the signal row with enrichment metrics. Safe no-op when
+    Supabase isn't configured or when the row doesn't exist."""
+    import db
+    if not db.is_configured():
+        return
+    try:
+        # LaunchMetrics has flat attrs; dump them to a dict the db helper
+        # knows how to consume.
+        metrics_dict = {
+            "initial_liq_usd": getattr(metrics, "initial_liq_usd", None),
+            "final_liq_usd": getattr(metrics, "final_liq_usd", None),
+            "buy_count": getattr(metrics, "buy_count", None),
+            "sell_count": getattr(metrics, "sell_count", None),
+            "unique_buyers": getattr(metrics, "unique_buyers", None),
+            "price_change_pct": getattr(metrics, "price_change_pct", None),
+            "final_price_usd": getattr(metrics, "final_price_usd", None),
+            "breakout_triggered": getattr(metrics, "breakout_triggered", None),
+            "breakout_score": getattr(metrics, "breakout_score", None),
+            "breakout_reason": getattr(metrics, "breakout_reason", None),
+            "error": getattr(metrics, "error", None),
+        }
+        await db.update_signal_phase2(
+            chain=event.chain,
+            pool_address=event.pool_address,
+            metrics=metrics_dict,
+        )
+    except Exception:
+        log.exception("phase2 persist failed for %s", event.pool_address[:10])
 
 
 async def _feed_engine(event: PoolEvent, metrics) -> None:
@@ -319,6 +412,12 @@ async def run_api():
 
 
 async def main() -> None:
+    # Install the DB log handler first thing so startup logs get captured too.
+    # The flusher task spawns after the engine hydrates — until then,
+    # records sit in the buffer (capped at 1000).
+    import db_logging
+    db_logging.install()
+
     cfg = load_config()
     scanners = []
 
@@ -343,8 +442,18 @@ async def main() -> None:
     from engine import engine
     import db
     await engine.hydrate()
+    await db_logging.start_flusher()
     log.info("DB persistence: %s",
              "enabled" if db.is_configured() else "disabled (state ephemeral)")
+
+    # Auto-start the engine if configured. This is the "bot" behavior —
+    # Railway redeploys / container restarts don't pause trading. Without
+    # this, the engine sits idle until a dashboard clicks /control start.
+    if ENGINE_AUTOSTART:
+        await engine.start()
+        log.info("Engine auto-started (ENGINE_AUTOSTART=true)")
+    else:
+        log.info("Engine waiting for /control start (set ENGINE_AUTOSTART=true to skip)")
 
     tasks = [asyncio.create_task(s.run(), name=s.name) for s in scanners]
     tasks.append(asyncio.create_task(run_api(), name="api"))
@@ -383,6 +492,8 @@ async def main() -> None:
     for t in tasks:
         t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
+    # Stop the log flusher last — gives shutdown logs a chance to persist
+    await db_logging.stop_flusher()
 
 
 if __name__ == "__main__":
