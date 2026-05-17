@@ -764,9 +764,14 @@ export default function App() {
         openedAt: t.opened_at, closedAt: t.closed_at,
       })));
       setEquity(state.equity);
-      // Params: merge so we don't blow away local-only fields (none today,
-      // but defensive against future drift).
-      setParams((prev) => ({ ...prev, ...state.params }));
+      // Params: merge from backend BUT NOT if the user just edited a slider
+      // locally. Without this guard, the 1s poll overwrites in-flight edits
+      // before the 400ms debounced save can land — sliders snap back to
+      // their pre-edit value. 2.5s window covers the save round-trip.
+      const sinceLocalEdit = Date.now() - lastLocalParamEditRef.current;
+      if (sinceLocalEdit > 2500 && state.params) {
+        setParams((prev) => ({ ...prev, ...state.params }));
+      }
     };
 
     poll();  // immediate first read
@@ -1244,6 +1249,17 @@ export default function App() {
 
   // When params change in remote mode, push the update to the backend.
   // Debounced so a slider drag doesn't fire 50 requests.
+  // Track when params were last edited locally. The /state poll runs
+  // every second; if it overwrites a slider while the user is still
+  // dragging it, the slider snaps back. We give 2.5s of "user wins"
+  // grace after every local edit — long enough for the 400ms debounced
+  // push to land AND a subsequent poll cycle to see the new value.
+  const lastLocalParamEditRef = useRef(0);
+  const setParamsLocal = (updater) => {
+    lastLocalParamEditRef.current = Date.now();
+    setParams(updater);
+  };
+
   const paramsPushTimerRef = useRef(null);
   useEffect(() => {
     if (engineMode !== "remote") return;
@@ -1384,9 +1400,10 @@ export default function App() {
           className="lg:col-span-3" right="editable">
           <ParamEditor
             params={params}
-            onChange={setParams}
+            onChange={setParamsLocal}
             startBalance={startBalance}
             onStartBalanceChange={(v) => {
+              lastLocalParamEditRef.current = Date.now();
               setStartBalance(v);
               setCash(v);
               setEquity([{ t: 0, v }]);
