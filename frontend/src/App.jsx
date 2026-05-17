@@ -515,8 +515,31 @@ export default function App() {
   const [logs, setLogs] = useState([]);
   const [trending, setTrending] = useState([]);  // DEXScreener-sourced tokens
 
-  const [signalSource, setSignalSource] = useState("synthetic");
-  const [enabledChains, setEnabledChains] = useState(["ETH", "SOL", "SUI"]);
+  // signalSource determines whether the WS connects (live) or synthetic
+  // signals are generated. Persisted so refreshing doesn't kick you back
+  // to synthetic mode mid-session.
+  const [signalSource, setSignalSource] = useState(() => {
+    try { return localStorage.getItem("forerunner.signalSource") || "synthetic"; }
+    catch (_) { return "synthetic"; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem("forerunner.signalSource", signalSource); } catch (_) {}
+  }, [signalSource]);
+
+  const [enabledChains, setEnabledChains] = useState(() => {
+    try {
+      const saved = localStorage.getItem("forerunner.enabledChains");
+      if (saved) {
+        const arr = JSON.parse(saved);
+        if (Array.isArray(arr) && arr.length > 0) return arr;
+      }
+    } catch (_) {}
+    return ["ETH", "SOL", "SUI"];
+  });
+  useEffect(() => {
+    try { localStorage.setItem("forerunner.enabledChains", JSON.stringify(enabledChains)); }
+    catch (_) {}
+  }, [enabledChains]);
   const [wsStatus, setWsStatus] = useState("disconnected");
   const wsRef = useRef(null);
   const liveSignalQueueRef = useRef([]);
@@ -786,8 +809,21 @@ export default function App() {
         // Map backend DB shape → frontend signal shape. The frontend uses
         // camelCase + a few synthetic fields; we fill in nulls for what
         // we don't have persisted.
+        //
+        // We FILTER OUT pure audit failures that have no enrichment data —
+        // those rows are useful for analytics (Supabase) but not for the
+        // live panel. A row with audit_passed=false AND no liq/buyers
+        // contributes nothing the user can act on; it's just clutter.
         if (sigRows.length > 0) {
-          const restored = sigRows.map((s) => ({
+          const interesting = sigRows.filter((s) => {
+            // Always include passing audits — they're tradeable candidates
+            if (s.audit_passed === true) return true;
+            // Include failures that DID get enriched (rare but meaningful)
+            if (s.unique_buyers != null || s.final_liq_usd != null) return true;
+            // Skip pure audit-failure noise
+            return false;
+          });
+          const restored = interesting.map((s) => ({
             id: -s.id,  // negative IDs so they don't collide with live _liveSigId
             chain: (s.chain || "").toUpperCase().slice(0, 3),
             dex: s.dex,
@@ -865,24 +901,30 @@ export default function App() {
 
         // ── System logs ──────────────────────────────────────────────────
         // The logs panel is most recent at top. Backend returns desc order;
-        // we map level+category+message to the {kind, text, ts} shape the
-        // log panel expects.
+        // we map level+category+message to the {kind, msg, ts} shape that
+        // matches what pushLog() creates for live session logs. The render
+        // path uses l.msg (string) and l.ts (formatted HH:MM:SS string).
         if (logRows.length > 0) {
-          const restored = logRows.map((row) => ({
-            id: row.id,
-            kind: row.category || "sys",
-            text: row.message || "",
-            ts: row.recorded_at ? new Date(row.recorded_at).getTime() : Date.now(),
-            level: row.level,
-            historical: true,
-          }));
+          const restored = logRows.map((row) => {
+            const d = row.recorded_at ? new Date(row.recorded_at) : new Date();
+            return {
+              id: row.id,
+              kind: row.category || "sys",
+              msg: row.message || "",
+              ts: d.toLocaleTimeString("en-US", { hour12: false }),
+              level: row.level,
+              historical: true,
+            };
+          });
           setLogs((prev) => {
-            // Avoid double-adding if user has logs in this session already.
-            // Logs aren't naturally dedup-able by ID across sources, so the
-            // simple approach: only restore if current logs are empty or
-            // near-empty (just the initial "harness ready" line).
-            if (prev.length > 5) return prev;
-            return [...prev, ...restored];
+            // Hydrated rows have a numeric DB `id`; session-generated logs
+            // do too (from nextId()), but in much lower ranges (<1000).
+            // Dedup by id to avoid re-adding the same historical log
+            // entries on subsequent hydration runs. Order: most recent
+            // session logs first, then historicals after.
+            const seenIds = new Set(prev.map((l) => l.id));
+            const fresh = restored.filter((r) => !seenIds.has(r.id));
+            return [...prev, ...fresh].slice(0, 200);
           });
         }
       } catch (err) {
