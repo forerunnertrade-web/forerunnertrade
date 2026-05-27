@@ -1716,8 +1716,8 @@ export default function App() {
 
 function ParamEditor({ params, onChange, startBalance, onStartBalanceChange, disabled }) {
   const fields = [
-    { key: "minLiqUsd",       label: "min liquidity ($)",  min: 500,  max: 100000, step: 500 },
-    { key: "minBuyers",       label: "min unique buyers",  min: 1,    max: 30,     step: 1 },
+    { key: "minLiqUsd",       label: "min liquidity ($)",  min: 0,    max: 100000, step: 500 },
+    { key: "minBuyers",       label: "min unique buyers",  min: 0,    max: 30,     step: 1 },
     { key: "minPriceChange",  label: "min Δ% in 30s",      min: -20,  max: 100,    step: 5 },
     { key: "minAuditScore",   label: "min audit score",    min: 0,    max: 100,    step: 5 },
     { key: "positionSizeUsd", label: "size (usd)",         min: 10,   max: 2000,   step: 10 },
