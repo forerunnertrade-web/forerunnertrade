@@ -49,6 +49,12 @@ TICK_SECONDS = 1.0
 EQUITY_CAP = 2000
 TRADE_CAP = 500
 
+# Price refresh: how often to fetch real spot prices for open positions.
+# Every PRICE_REFRESH_TICKS ticks we hit the price oracle; in between we
+# hold the last-known mark. 5s is conservative — gives TP/SL ~5s latency
+# but keeps RPC calls bounded.
+PRICE_REFRESH_TICKS = 5
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Data classes
@@ -66,6 +72,10 @@ class Position:
     tp_pct: float
     sl_pct: float
     opened_at: float     # epoch ms
+    # Optional fields for live mark-to-market via price_oracle. Default to
+    # None for backwards compat with existing rows.
+    pool_address: Optional[str] = None
+    quote_address: Optional[str] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -142,6 +152,12 @@ class SimulationEngine:
         # Signal queue — populated by scanners via add_signal()
         self._signals: asyncio.Queue = asyncio.Queue(maxsize=200)
 
+        # Live-price cache: filled by an oracle task every PRICE_REFRESH_TICKS.
+        # Empty dict means "no fresh prices yet — use drift". Entries
+        # auto-expire when the position is closed (we sweep on close).
+        self._latest_prices: dict[int, float] = {}
+        self._price_refresh_inflight: bool = False
+
     def _next(self) -> int:
         n = self._next_id
         self._next_id += 1
@@ -178,6 +194,8 @@ class SimulationEngine:
                         entry_px=p["entry_px"], mark_px=p["mark_px"],
                         bias=p["bias"], tp_pct=p["tp_pct"], sl_pct=p["sl_pct"],
                         opened_at=p["opened_at"],
+                        pool_address=p.get("pool_address"),
+                        quote_address=p.get("quote_address"),
                     )
                     self.positions[pos.id] = pos
                     # Keep _next_id ahead of all restored IDs
@@ -333,21 +351,31 @@ class SimulationEngine:
             self.last_tick_at = time.time()
             now_ms = self.last_tick_at * 1000
 
-            # ── 1. Drift marks ───────────────────────────────────────────────
-            # For now: small random walk. Live mode replacement is a separate
-            # piece of work — would query an oracle/AMM for current price
-            # per position. The current marks are still "real" entries from
-            # the enricher's final_price_usd, but they don't update without
-            # this drift.
+            # ── 1. Mark to market ────────────────────────────────────────────
+            # On refresh ticks, pull real spot prices from on-chain AMMs via
+            # the price oracle. On other ticks (or when oracle didn't return
+            # for a position), apply small random-walk drift so the chart
+            # animates and stale positions can still time-out gracefully.
+            #
+            # The actual oracle fetch happens in a separate task spawned
+            # below (outside the lock) — here we just consume whatever the
+            # last refresh produced. This keeps the lock-hold time bounded
+            # to in-memory work.
+            refreshed = self._latest_prices  # dict[pos_id, price] populated by oracle task
             for pos in self.positions.values():
-                drift = random.uniform(-0.04, 0.05) + pos.bias
-                pos.mark_px = max(1e-9, pos.mark_px * (1 + drift))
+                fresh = refreshed.get(pos.id)
+                if fresh is not None:
+                    pos.mark_px = max(1e-9, float(fresh))
+                else:
+                    drift = random.uniform(-0.04, 0.05) + pos.bias
+                    pos.mark_px = max(1e-9, pos.mark_px * (1 + drift))
 
             # Track what changed so we can flush to DB after the lock releases.
             # Trades and positions are the "expensive" writes; equity is
             # throttled inside db.append_equity_point.
             closed_trades: list[Trade] = []
             position_set_dirty = False
+            opened_signals_in_tick: list[tuple] = []  # (chain, pool_address, position_id)
 
             # ── 2. Close positions hitting TP/SL/timeout ────────────────────
             close_age_ms = 45_000
@@ -364,6 +392,8 @@ class SimulationEngine:
 
             for pos_id, reason in to_close:
                 pos = self.positions.pop(pos_id)
+                # Drop any cached oracle price for this closed position
+                self._latest_prices.pop(pos_id, None)
                 proceeds = pos.qty * pos.mark_px
                 self.cash += proceeds
                 pnl_usd = (pos.mark_px - pos.entry_px) * pos.qty
@@ -412,6 +442,8 @@ class SimulationEngine:
                             tp_pct=self.params["takeProfitPct"],
                             sl_pct=self.params["stopLossPct"],
                             opened_at=now_ms,
+                            pool_address=sig.get("pool_address"),
+                            quote_address=sig.get("quote_address"),
                         )
                         self.positions[pos.id] = pos
                         self.cash -= self.params["positionSizeUsd"]
@@ -420,6 +452,15 @@ class SimulationEngine:
                             "OPEN %s %s qty=%.4f @ $%.6g",
                             pos.chain, pos.symbol, qty, entry_px
                         )
+                        # Mark the corresponding signal row as acted-on.
+                        # The signal's `pool_address` was set when the signal
+                        # was queued. chain normalization: signals table
+                        # stores internal names ("ethereum") not codes ("ETH"),
+                        # so map back via the same helper used in main.py.
+                        sig_pool = sig.get("pool_address")
+                        if sig_pool:
+                            opened_signal = (sig.get("chain", "?"), sig_pool, pos.id)
+                            opened_signals_in_tick.append(opened_signal)
 
             # ── 4. Equity snapshot ──────────────────────────────────────────
             open_value = sum(p.qty * p.mark_px for p in self.positions.values())
@@ -436,6 +477,11 @@ class SimulationEngine:
             tick_t = self.tick_count
             equity_v = total_equity
             positions_snap = [self._position_to_dict(p) for p in self.positions.values()] if position_set_dirty else None
+            # Always snapshot for price-oracle quoting — we need a stable
+            # view of which positions to quote even if the set didn't change.
+            positions_to_quote = [
+                self._position_to_dict(p) for p in self.positions.values()
+            ]
 
         # ── 5. Flush to DB OUTSIDE the lock ─────────────────────────────────
         # Fire-and-forget: DB latency must not throttle the tick rate.
@@ -454,6 +500,55 @@ class SimulationEngine:
                 asyncio.create_task(self._save_settings_safe(sb_snap, cash_snap, params_snap))
             # Equity: throttled inside db module to ~once per 5s
             asyncio.create_task(self._safe_append_equity(tick_t, equity_v))
+            # Signals: mark acted_on for any position opened this tick
+            for chain_code, pool_addr, position_id in opened_signals_in_tick:
+                asyncio.create_task(self._safe_mark_signal_acted(
+                    chain_code, pool_addr, position_id
+                ))
+
+        # ── 6. Price oracle refresh ───────────────────────────────────────────
+        # Outside the lock so RPC latency (up to 6s) doesn't block the tick
+        # loop. Only spawn if not already in flight (avoids stacked tasks
+        # under network slowness).
+        if tick_t % PRICE_REFRESH_TICKS == 0 and not self._price_refresh_inflight:
+            asyncio.create_task(self._refresh_prices(positions_to_quote=positions_to_quote))
+
+    async def _refresh_prices(self, positions_to_quote: list[dict]) -> None:
+        """Fetch live spot prices for the given positions; store in cache.
+        Caller (tick loop) populates the cache from this dict next tick."""
+        if not positions_to_quote:
+            return
+        self._price_refresh_inflight = True
+        try:
+            from price_oracle import fetch_position_prices
+            fresh = await fetch_position_prices(positions_to_quote)
+            if fresh:
+                # Merge (don't replace) so cached entries for unaffected
+                # positions linger across refreshes.
+                self._latest_prices.update(fresh)
+                log.debug("Refreshed %d position prices", len(fresh))
+        except Exception:
+            log.exception("price refresh failed")
+        finally:
+            self._price_refresh_inflight = False
+
+    async def _safe_mark_signal_acted(
+        self, chain_code: str, pool_address: str, position_id: int
+    ) -> None:
+        """Map the engine's chain code (ETH/SOL) to the internal name used
+        by the signals table (ethereum/solana) and mark the signal."""
+        import db
+        chain_map = {
+            "ETH": "ethereum", "SOL": "solana", "SUI": "sui",
+            "BASE": "base", "BSC": "bsc", "POLY": "polygon", "ARB": "arbitrum",
+        }
+        chain = chain_map.get(chain_code.upper(), chain_code.lower())
+        try:
+            await db.mark_signal_acted_on(
+                chain=chain, pool_address=pool_address, position_id=position_id
+            )
+        except Exception:
+            log.exception("mark_signal_acted_on failed")
 
     @staticmethod
     def _position_to_dict(p: "Position") -> dict:
@@ -486,21 +581,50 @@ class SimulationEngine:
             log.exception("append_equity_point failed")
 
     def _signal_passes(self, sig: dict) -> bool:
-        """Same filter logic as frontend's strategyPasses, ported."""
+        """Source-aware strategy filter.
+
+        Two signal sources with different available data:
+          - "scanner": on-chain new-pool detection. Has 30s enrichment:
+            unique_buyers, price_change_pct, breakout. Full filter applies.
+          - "dexscreener-trending": tokens already trending. We have
+            liquidity, price, and 1h change, but NO 30s buyer count or
+            breakout (those are launch-window concepts). Applying the
+            buyer/breakout filters here would reject 100% of trending
+            signals, since the data is structurally absent.
+
+        So: liquidity + price-change + audit-score apply to BOTH. Buyer
+        count and breakout apply ONLY to scanner signals.
+        """
         p = self.params
+        source = sig.get("source", "scanner")
+        is_trending = source == "dexscreener-trending"
+
+        # Audit score — always applies
         if (sig.get("audit_score") or 0) < p["minAuditScore"]:
             return False
+
+        # Liquidity — always applies (both sources carry liq_usd)
         liq = sig.get("liq_usd")
         if p["minLiqUsd"] > 0 and (liq is None or liq < p["minLiqUsd"]):
             return False
-        buyers = sig.get("unique_buyers")
-        if p["minBuyers"] > 0 and (buyers is None or buyers < p["minBuyers"]):
-            return False
+
+        # Price change — always applies (trending uses 1h change as proxy)
         pc = sig.get("price_change_pct")
         if p["minPriceChange"] > 0 and (pc is None or pc < p["minPriceChange"]):
             return False
-        if p["requireBreakout"] and not sig.get("breakout_triggered"):
-            return False
+
+        # Buyer count — scanner signals only. Trending tokens have no 30s
+        # buyer count, so skip this filter for them rather than auto-reject.
+        if not is_trending:
+            buyers = sig.get("unique_buyers")
+            if p["minBuyers"] > 0 and (buyers is None or buyers < p["minBuyers"]):
+                return False
+
+        # Breakout — scanner signals only. Same rationale.
+        if not is_trending:
+            if p["requireBreakout"] and not sig.get("breakout_triggered"):
+                return False
+
         return True
 
 
