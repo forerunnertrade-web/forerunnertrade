@@ -575,6 +575,13 @@ class SimulationEngine:
             "qty": p.qty, "entry_px": p.entry_px, "mark_px": p.mark_px,
             "bias": p.bias, "tp_pct": p.tp_pct, "sl_pct": p.sl_pct,
             "opened_at": p.opened_at,
+            # Without these, the price oracle has no way to look up the
+            # bonding-curve PDA or Raydium pool for mark-to-market. The
+            # serializer used to drop them silently — paper P&L came from
+            # random-walk drift, not from real prices. Including them now.
+            "pool_address": p.pool_address,
+            "quote_address": p.quote_address,
+            "dex": p.dex,
         }
 
     async def _safe_insert_trade(self, trade_dict: dict) -> None:
