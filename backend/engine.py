@@ -583,45 +583,45 @@ class SimulationEngine:
     def _signal_passes(self, sig: dict) -> bool:
         """Source-aware strategy filter.
 
-        Two signal sources with different available data:
+        Three signal sources with different available data:
           - "scanner": on-chain new-pool detection. Has 30s enrichment:
             unique_buyers, price_change_pct, breakout. Full filter applies.
           - "dexscreener-trending": tokens already trending. We have
             liquidity, price, and 1h change, but NO 30s buyer count or
-            breakout (those are launch-window concepts). Applying the
-            buyer/breakout filters here would reject 100% of trending
-            signals, since the data is structurally absent.
+            breakout (those are launch-window concepts).
+          - "pumpfun": pump.fun bonding-curve launches. Same data shape
+            as trending — no 30s buyer count available pre-graduation.
 
-        So: liquidity + price-change + audit-score apply to BOTH. Buyer
-        count and breakout apply ONLY to scanner signals.
+        So: liquidity + price-change + audit-score apply to ALL. Buyer
+        count and breakout apply ONLY to "scanner" signals.
         """
         p = self.params
         source = sig.get("source", "scanner")
-        is_trending = source == "dexscreener-trending"
+        # Sources that don't have 30s launch-window data
+        no_window_data = source in ("dexscreener-trending", "pumpfun")
 
         # Audit score — always applies
         if (sig.get("audit_score") or 0) < p["minAuditScore"]:
             return False
 
-        # Liquidity — always applies (both sources carry liq_usd)
+        # Liquidity — always applies (all sources carry liq_usd)
         liq = sig.get("liq_usd")
         if p["minLiqUsd"] > 0 and (liq is None or liq < p["minLiqUsd"]):
             return False
 
-        # Price change — always applies (trending uses 1h change as proxy)
-        pc = sig.get("price_change_pct")
-        if p["minPriceChange"] > 0 and (pc is None or pc < p["minPriceChange"]):
-            return False
+        # Price change — applies to scanner (30s) and trending (1h);
+        # NOT to pumpfun where we have no price history yet.
+        if source != "pumpfun":
+            pc = sig.get("price_change_pct")
+            if p["minPriceChange"] > 0 and (pc is None or pc < p["minPriceChange"]):
+                return False
 
-        # Buyer count — scanner signals only. Trending tokens have no 30s
-        # buyer count, so skip this filter for them rather than auto-reject.
-        if not is_trending:
+        # Buyer count + breakout — scanner signals only. Other sources
+        # have no 30s launch-window data, so skip rather than auto-reject.
+        if not no_window_data:
             buyers = sig.get("unique_buyers")
             if p["minBuyers"] > 0 and (buyers is None or buyers < p["minBuyers"]):
                 return False
-
-        # Breakout — scanner signals only. Same rationale.
-        if not is_trending:
             if p["requireBreakout"] and not sig.get("breakout_triggered"):
                 return False
 

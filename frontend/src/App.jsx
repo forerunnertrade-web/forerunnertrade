@@ -256,15 +256,20 @@ function strategyPasses(sig, params) {
   if (sig.status !== "ready") return null;
   if (sig.auditScore < params.minAuditScore) return false;
 
-  // Source-aware: trending signals have no 30s buyer count or breakout
-  // data (those are launch-window concepts), so we skip those filters for
-  // them rather than auto-rejecting. Mirrors backend engine._signal_passes.
-  const isTrending = sig.source === "dexscreener-trending";
+  // Source-aware: trending and pump.fun signals have no 30s buyer count
+  // or breakout data (those are launch-window concepts), so we skip those
+  // filters for them rather than auto-rejecting. Pump.fun also lacks price
+  // history at detection, so the price-change filter is skipped for it too.
+  // Mirrors backend engine._signal_passes.
+  const noWindowData = sig.source === "dexscreener-trending" || sig.source === "pumpfun";
+  const isPumpfun = sig.source === "pumpfun";
 
   if (params.minLiqUsd > 0 && (sig.liqUsd == null || sig.liqUsd < params.minLiqUsd)) return false;
-  if (params.minPriceChange > 0 && (sig.priceChange == null || sig.priceChange < params.minPriceChange)) return false;
+  if (!isPumpfun) {
+    if (params.minPriceChange > 0 && (sig.priceChange == null || sig.priceChange < params.minPriceChange)) return false;
+  }
 
-  if (!isTrending) {
+  if (!noWindowData) {
     if (params.minBuyers > 0 && (sig.uniqueBuyers == null || sig.uniqueBuyers < params.minBuyers)) return false;
     // Breakout filter (optional). If on, the signal must have triggered the
     // local breakout detector. Audit-only signals (no priceSamples) fail this

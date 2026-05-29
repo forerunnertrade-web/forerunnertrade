@@ -33,6 +33,7 @@ from scanners.base import PoolEvent
 from scanners.ethereum import EthereumScanner
 from scanners.solana import SolanaScanner
 from scanners.sui import SuiScanner
+from scanners.pumpfun import PumpFunScanner
 
 logging.basicConfig(
     level=logging.INFO,
@@ -292,6 +293,86 @@ async def on_pool(event: PoolEvent) -> None:
         asyncio.create_task(broadcast_metrics(event, empty))
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# pump.fun launch handler
+# ─────────────────────────────────────────────────────────────────────────────
+async def on_pumpfun_launch(event: PoolEvent) -> None:
+    """Handle a pump.fun token launch.
+
+    Different from on_pool because pump.fun tokens are on a bonding curve,
+    not an AMM. The "audit" we do for Raydium pools (mint authority revoked,
+    freeze authority revoked, etc.) is meaningless here — pump.fun itself
+    controls the mint until graduation, then it's burned. So we treat
+    pump.fun events as auto-passing audit and skip enrichment; the engine
+    decides whether to act based on the strategy filter + the marketCap-based
+    entry price.
+
+    Persisted as a "scanner" source signal with source label adjusted so
+    downstream analytics can split out pump.fun trades vs Raydium ones.
+    """
+    raw = event.raw or {}
+    symbol = raw.get("symbol") or event.token0[:8]
+    market_cap_sol = float(raw.get("marketCapSol") or 0)
+    v_sol = float(raw.get("vSolInBondingCurve") or 0)
+
+    log.info(
+        "PumpFun launch: %s mint=%s mcap=%.1f SOL liq=%.1f SOL",
+        symbol, event.token0[:10], market_cap_sol, v_sol,
+    )
+
+    # Convert SOL → USD for the engine's filters. Using a hardcoded SOL/USD
+    # is the same approximation we use elsewhere; engine TP/SL is %-based
+    # so absolute USD error cancels at entry/exit.
+    SOL_USD = 180.0  # rough; in line with price_oracle fallback
+    market_cap_usd = market_cap_sol * SOL_USD
+    liq_usd = v_sol * SOL_USD
+
+    # Persist phase-1 signal (auto-pass, score 100 for "trust pump.fun")
+    import db
+    if db.is_configured():
+        asyncio.create_task(db.upsert_signal_phase1(
+            source="pumpfun",
+            chain="solana",
+            dex="pumpfun",
+            pool_address=event.pool_address,
+            token_address=event.token0,
+            quote_address=event.token1,
+            symbol=symbol,
+            audit_passed=True,
+            audit_score=100,
+            audit_reason="pump.fun bonding curve (audit n/a)",
+        ))
+
+    # Derive a per-token price from the bonding-curve numbers.
+    # On pump.fun, price ≈ vSolInBondingCurve / vTokensInBondingCurve.
+    v_tokens = float(raw.get("vTokensInBondingCurve") or 0)
+    if v_tokens > 0 and v_sol > 0:
+        price_sol = v_sol / v_tokens
+        price_usd = price_sol * SOL_USD
+    else:
+        # Fall back to deriving from marketCap if curve isn't populated yet
+        # (pump.fun reports 0/0 for the first block after launch occasionally).
+        price_usd = (market_cap_usd / 1_000_000_000) if market_cap_usd else 0.0
+
+    # Feed the engine. Trending-style payload — no breakout/buyer data,
+    # source-aware filter will skip those checks.
+    from engine import engine
+    await engine.add_signal({
+        "chain": "SOL",
+        "symbol": symbol,
+        "address": event.token0,
+        "pool_address": event.pool_address,
+        "quote_address": event.token1,
+        "audit_score": 100,
+        "liq_usd": liq_usd,
+        "unique_buyers": None,           # not available pre-launch
+        "price_change_pct": None,        # no history yet
+        "final_price_usd": price_usd,
+        "breakout_triggered": None,
+        "source": "pumpfun",
+    })
+
+
 async def _enrich_and_broadcast_evm(rpc_url: str, event: PoolEvent) -> None:
     """Background EVM enrichment. Throttled by a semaphore."""
     async with _enrich_sem:
@@ -432,6 +513,15 @@ async def main() -> None:
     sui = cfg.chains["sui"]
     if sui.enabled:
         scanners.append(SuiScanner(on_pool, sui.rpc_ws, sui.factories))
+
+    # Pump.fun: separate path because it doesn't follow the
+    # factory-detect-then-audit flow. Bonding-curve tokens need different
+    # treatment — see on_pumpfun_launch below.
+    if os.getenv("PUMPFUN_ENABLED", "false").lower() == "true":
+        scanners.append(PumpFunScanner(on_pumpfun_launch))
+        log.info("PumpFun: scanner enabled")
+    else:
+        log.info("PumpFun: scanner disabled (set PUMPFUN_ENABLED=true)")
 
     if not scanners:
         log.warning("No scanners enabled — running API only.")
