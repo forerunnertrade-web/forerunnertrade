@@ -251,13 +251,181 @@ async def _fetch_solana_price(client, rpc_url, pool, token) -> _MarkResult:
         if hint is not None:
             quote_usd = hint
         elif quote_mint_addr == _WSOL:
-            quote_usd = SOL_USD_FALLBACK  # see TODO above; oracle integration deferred
+            quote_usd = await _get_sol_usd(client, rpc_url)
         else:
             return _MarkResult(pool, None, f"unknown quote: {quote_mint_addr[:12]}")
 
         return _MarkResult(pool, price_in_quote * quote_usd)
     except Exception as e:
         return _MarkResult(pool, None, f"{type(e).__name__}: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pyth SOL/USD oracle (cached)
+# ─────────────────────────────────────────────────────────────────────────────
+# Pyth publishes a SOL/USD price feed at a well-known Solana account.
+# We read it via getAccountInfo and decode the price field. Cached for 60s
+# since SOL price doesn't move enough to need sub-minute precision for
+# paper-trading marks.
+#
+# Pyth account layout reference:
+#   https://docs.pyth.network/price-feeds/how-pyth-works/account-types
+# The 'price' field lives at offset 208 (signed i64) and 'expo' at 216
+# (signed i32). Final price = price * 10^expo (expo is usually -8 for USD pairs).
+
+PYTH_SOL_USD_FEED = "H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG"
+_PYTH_PRICE_OFFSET = 208
+_PYTH_EXPO_OFFSET = 216
+_SOL_USD_CACHE = {"value": None, "fetched_at": 0.0}
+_SOL_USD_CACHE_TTL = 60.0  # seconds
+
+
+async def _get_sol_usd(client, rpc_url) -> float:
+    """Returns current SOL/USD price. Falls back to a hardcoded value on
+    any failure rather than blocking the price refresh — engine TP/SL is
+    %-based so absolute USD error is bounded."""
+    import time
+    now = time.time()
+    cached_val = _SOL_USD_CACHE["value"]
+    cached_at = _SOL_USD_CACHE["fetched_at"]
+    if cached_val is not None and (now - cached_at) < _SOL_USD_CACHE_TTL:
+        return cached_val
+
+    try:
+        import base64
+        resp = await client.post(rpc_url, json={
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getAccountInfo",
+            "params": [PYTH_SOL_USD_FEED, {"encoding": "base64"}],
+        })
+        body = resp.json()
+        value = (body.get("result") or {}).get("value")
+        if not value:
+            log.warning("pyth SOL/USD: account not found, using fallback")
+            return SOL_USD_FALLBACK
+        data_b64 = value.get("data", [None])[0]
+        if not data_b64:
+            return SOL_USD_FALLBACK
+        data = base64.b64decode(data_b64)
+
+        # Need at least 220 bytes to read both price and expo
+        if len(data) < 220:
+            log.warning("pyth SOL/USD: unexpected account size %d", len(data))
+            return SOL_USD_FALLBACK
+
+        # Signed little-endian i64 + i32
+        price_raw = int.from_bytes(
+            data[_PYTH_PRICE_OFFSET:_PYTH_PRICE_OFFSET + 8],
+            "little", signed=True,
+        )
+        expo = int.from_bytes(
+            data[_PYTH_EXPO_OFFSET:_PYTH_EXPO_OFFSET + 4],
+            "little", signed=True,
+        )
+        price = price_raw * (10 ** expo)
+
+        # Sanity: SOL/USD should be in a plausible range
+        if not (10 < price < 10000):
+            log.warning("pyth SOL/USD: price %.4f out of plausible range", price)
+            return SOL_USD_FALLBACK
+
+        _SOL_USD_CACHE["value"] = price
+        _SOL_USD_CACHE["fetched_at"] = now
+        log.debug("pyth SOL/USD updated: $%.2f", price)
+        return price
+    except Exception as e:
+        log.warning("pyth SOL/USD read failed: %s — using fallback", e)
+        return SOL_USD_FALLBACK
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# pump.fun bonding-curve price reader
+# ─────────────────────────────────────────────────────────────────────────────
+# Pump.fun tokens trade against a constant-product virtual reserve, not a
+# traditional AMM with two vault accounts. The bonding-curve PDA holds the
+# state. PumpPortal already gives us this address as `bondingCurveKey`, so
+# we just need to decode the account data.
+#
+# Layout (after the 8-byte Anchor discriminator, pump.fun is NOT padded):
+#   offset  size  field
+#      0    8    discriminator
+#      8    8    virtualTokenReserves (u64 LE) — in token base units (10^6)
+#     16    8    virtualSolReserves   (u64 LE) — in lamports (10^9)
+#     24    8    realTokenReserves    (u64 LE)
+#     32    8    realSolReserves      (u64 LE)
+#     40    8    tokenTotalSupply     (u64 LE)
+#     48    1    complete             (bool) — true once token graduated to Raydium
+#
+# Price formula:
+#   sol_per_token = (virtualSolReserves / 1e9) / (virtualTokenReserves / 1e6)
+#                 = virtualSolReserves / virtualTokenReserves * 1e-3
+#   usd_per_token = sol_per_token * sol_usd
+#
+# When `complete` is true, the bonding curve is frozen and price discovery
+# must move to Raydium. We return None in that case; caller (engine) holds
+# the last-known mark until either we re-route through Raydium or the
+# position closes.
+
+PUMPFUN_TOKEN_DECIMALS = 6     # All pump.fun tokens use 6 decimals
+LAMPORTS_PER_SOL = 1_000_000_000
+
+
+async def _fetch_pumpfun_price(client, rpc_url, bonding_curve_pda) -> _MarkResult:
+    """Read pump.fun bonding-curve PDA and compute current spot price USD."""
+    try:
+        import base64
+        resp = await client.post(rpc_url, json={
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getAccountInfo",
+            "params": [bonding_curve_pda, {"encoding": "base64"}],
+        })
+        body = resp.json()
+        if "error" in body:
+            return _MarkResult(bonding_curve_pda, None,
+                               f"rpc error: {body['error'].get('message', '?')[:60]}")
+
+        value = (body.get("result") or {}).get("value")
+        if not value:
+            return _MarkResult(bonding_curve_pda, None, "bonding curve not found")
+
+        data_b64 = value.get("data", [None])[0]
+        if not data_b64:
+            return _MarkResult(bonding_curve_pda, None, "empty curve data")
+
+        data = base64.b64decode(data_b64)
+        if len(data) < 49:
+            return _MarkResult(bonding_curve_pda, None,
+                               f"curve too short: {len(data)} bytes")
+
+        # Skip 8-byte discriminator
+        v_tokens = int.from_bytes(data[8:16], "little")
+        v_sol = int.from_bytes(data[16:24], "little")
+        complete = bool(data[48])
+
+        if complete:
+            # Token has graduated. Caller should route to Raydium for this
+            # token from now on. We don't know its Raydium pool address
+            # from here, so return None and let the position hold its mark.
+            return _MarkResult(bonding_curve_pda, None,
+                               "bonding curve complete (graduated)")
+
+        if v_tokens == 0:
+            return _MarkResult(bonding_curve_pda, None, "zero token reserves")
+
+        # Spot price in SOL per token, with decimal correction:
+        #   v_sol is in lamports (1e9 per SOL)
+        #   v_tokens is in token base units (1e6 per token)
+        sol_per_token = (v_sol / LAMPORTS_PER_SOL) / (v_tokens / (10 ** PUMPFUN_TOKEN_DECIMALS))
+
+        sol_usd = await _get_sol_usd(client, rpc_url)
+        price_usd = sol_per_token * sol_usd
+
+        if price_usd <= 0:
+            return _MarkResult(bonding_curve_pda, None, "zero price computed")
+
+        return _MarkResult(bonding_curve_pda, price_usd)
+    except Exception as e:
+        return _MarkResult(bonding_curve_pda, None, f"{type(e).__name__}: {e}")
 
 
 async def fetch_position_prices(positions: list[dict]) -> dict[int, float]:
@@ -281,6 +449,7 @@ async def fetch_position_prices(positions: list[dict]) -> dict[int, float]:
             chain = (p.get("chain") or "").upper()
             pool = p.get("pool_address") or p.get("poolAddress")
             tok = p.get("address")
+            dex = (p.get("dex") or "").lower()
             if not pool or not tok:
                 continue
             if chain == "ETH" and eth_rpc:
@@ -288,7 +457,14 @@ async def fetch_position_prices(positions: list[dict]) -> dict[int, float]:
                 tasks.append(_fetch_evm_price(client, eth_rpc, pool, tok, quote))
                 meta.append(p["id"])
             elif chain == "SOL" and sol_rpc:
-                tasks.append(_fetch_solana_price(client, sol_rpc, pool, tok))
+                # Route to pump.fun reader when dex is explicitly pumpfun,
+                # otherwise default to the Raydium V4 path. Old positions
+                # without a dex field stored fall through to Raydium —
+                # safe default since pumpfun is a newer feature.
+                if dex == "pumpfun":
+                    tasks.append(_fetch_pumpfun_price(client, sol_rpc, pool))
+                else:
+                    tasks.append(_fetch_solana_price(client, sol_rpc, pool, tok))
                 meta.append(p["id"])
 
         if not tasks:

@@ -258,11 +258,13 @@ async def sync_positions(positions: list[dict]) -> bool:
         "opened_at": _epoch_ms_to_iso(p["opened_at"]),
         "pool_address": p.get("pool_address"),
         "quote_address": p.get("quote_address"),
+        "dex": p.get("dex"),
     } for p in positions]
 
     resp = await _request(
         "POST", "/positions",
         json=rows,
+        params={"on_conflict": "user_id,client_id"},
         headers={"Prefer": "resolution=merge-duplicates"},
     )
     return resp is not None
@@ -297,6 +299,7 @@ def _position_row_to_engine_shape(r: dict) -> dict:
         "opened_at": _iso_to_epoch_ms(r["opened_at"]),
         "pool_address": r.get("pool_address"),
         "quote_address": r.get("quote_address"),
+        "dex": r.get("dex"),
     }
 
 

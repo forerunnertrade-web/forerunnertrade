@@ -320,10 +320,21 @@ async def on_pumpfun_launch(event: PoolEvent) -> None:
         symbol, event.token0[:10], market_cap_sol, v_sol,
     )
 
-    # Convert SOL → USD for the engine's filters. Using a hardcoded SOL/USD
-    # is the same approximation we use elsewhere; engine TP/SL is %-based
-    # so absolute USD error cancels at entry/exit.
-    SOL_USD = 180.0  # rough; in line with price_oracle fallback
+    # Convert SOL → USD for the engine's filters. Read the cached Pyth feed
+    # so entry-price math matches what the price oracle will use at mark
+    # time. The cache is 60s so this is cheap on the hot path.
+    try:
+        import httpx as _httpx
+        from price_oracle import _get_sol_usd
+        sol_rpc = os.getenv("SOL_HTTP_URL", "")
+        if sol_rpc:
+            async with _httpx.AsyncClient(timeout=4.0) as _c:
+                SOL_USD = await _get_sol_usd(_c, sol_rpc)
+        else:
+            from price_oracle import SOL_USD_FALLBACK
+            SOL_USD = SOL_USD_FALLBACK
+    except Exception:
+        SOL_USD = 180.0
     market_cap_usd = market_cap_sol * SOL_USD
     liq_usd = v_sol * SOL_USD
 
@@ -371,6 +382,27 @@ async def on_pumpfun_launch(event: PoolEvent) -> None:
         "breakout_triggered": None,
         "source": "pumpfun",
     })
+
+    # Also broadcast over WS so the dashboard's Live Signals panel shows
+    # the pump.fun token. Without this, only scanner-source signals appear
+    # in that panel and positions seem to open from nowhere.
+    from auditor import AuditResult
+    pumpfun_audit = AuditResult(
+        passed=True, score=100,
+        reason="pump.fun bonding curve (audit n/a)"
+    )
+    await broadcast_pool_event(event, pumpfun_audit)
+    # And broadcast a "metrics" message so the row shows liq/price right
+    # away rather than sitting in "pending" forever. Build a minimal
+    # LaunchMetrics-shaped object the broadcast function expects.
+    from scanners.base import LaunchMetrics
+    pumpfun_metrics = LaunchMetrics(
+        sample_seconds=0,
+        initial_liq_usd=liq_usd,
+        final_liq_usd=liq_usd,
+        final_price_usd=price_usd,
+    )
+    await broadcast_metrics(event, pumpfun_metrics)
 
 
 async def _enrich_and_broadcast_evm(rpc_url: str, event: PoolEvent) -> None:

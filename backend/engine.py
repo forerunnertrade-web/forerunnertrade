@@ -76,6 +76,12 @@ class Position:
     # None for backwards compat with existing rows.
     pool_address: Optional[str] = None
     quote_address: Optional[str] = None
+    # dex tells the price oracle which AMM layout to read. Currently:
+    #   "pumpfun"  → read bonding-curve PDA
+    #   "raydium" / None → read Raydium V4 pool vaults
+    #   "uniswap" / "uniswap-v2" → read EVM V2 reserves
+    # Stored on the position so the engine restart can resume marking.
+    dex: Optional[str] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -196,6 +202,7 @@ class SimulationEngine:
                         opened_at=p["opened_at"],
                         pool_address=p.get("pool_address"),
                         quote_address=p.get("quote_address"),
+                        dex=p.get("dex"),
                     )
                     self.positions[pos.id] = pos
                     # Keep _next_id ahead of all restored IDs
@@ -430,6 +437,16 @@ class SimulationEngine:
                     entry_px = float(sig.get("final_price_usd") or 1.0)
                     if entry_px > 0:
                         qty = self.params["positionSizeUsd"] / entry_px
+                        # Map signal source → dex hint for the price oracle.
+                        # pumpfun signals need to read bonding-curve PDA;
+                        # scanner/trending signals on Solana hit Raydium V4.
+                        source = sig.get("source", "scanner")
+                        if source == "pumpfun":
+                            dex_hint = "pumpfun"
+                        elif sig.get("chain") in ("ETH", "BASE", "BSC", "POLY", "ARB"):
+                            dex_hint = "uniswap-v2"  # default EVM
+                        else:
+                            dex_hint = "raydium"
                         pos = Position(
                             id=self._next(),
                             chain=sig.get("chain", "?"),
@@ -444,6 +461,7 @@ class SimulationEngine:
                             opened_at=now_ms,
                             pool_address=sig.get("pool_address"),
                             quote_address=sig.get("quote_address"),
+                            dex=dex_hint,
                         )
                         self.positions[pos.id] = pos
                         self.cash -= self.params["positionSizeUsd"]
