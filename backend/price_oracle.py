@@ -457,23 +457,135 @@ async def _fetch_pumpfun_price(client, rpc_url, bonding_curve_pda) -> _MarkResul
         return _MarkResult(bonding_curve_pda, None, f"{type(e).__name__}: {e}")
 
 
+async def _fetch_pumpfun_prices_batched(
+    client, rpc_url: str, positions: list[dict]
+) -> dict[int, "_MarkResult"]:
+    """Batch-read N pump.fun bonding curves in a single RPC call.
+
+    Why this matters: previously we made one getAccountInfo call per open
+    position, every 5 seconds. With 5 positions that's 60 RPCs/minute just
+    for mark refreshes — enough to blow free-tier quotas on a Solana RPC.
+    `getMultipleAccountsInfo` lets us pack all N into one HTTP request,
+    cutting RPC volume 5x. Same wire format as getAccountInfo, just a list.
+
+    Returns {position_id: _MarkResult}. Each position gets its own result —
+    if the batched call fails entirely, all positions get the same error;
+    if individual entries in the response are null/malformed, only those
+    positions get errors. This preserves the per-position error surfacing
+    in the dispatcher.
+
+    Limit: Solana RPC caps getMultipleAccountsInfo at ~100 accounts per
+    request. We're nowhere near that with `maxConcurrent` of 5-10, so no
+    chunking needed yet. If/when we lift that limit, chunk this here.
+    """
+    import base64
+    if not positions:
+        return {}
+
+    pdas = [p["pool_address"] for p in positions]
+    pos_ids = [p["id"] for p in positions]
+
+    try:
+        resp = await client.post(rpc_url, json={
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getMultipleAccountsInfo",
+            "params": [pdas, {"encoding": "base64"}],
+        })
+        body = resp.json()
+        if "error" in body:
+            # Whole-batch failure — propagate same error to every position
+            err = f"rpc error: {body['error'].get('message', '?')[:80]}"
+            return {pid: _MarkResult(pdas[i], None, err) for i, pid in enumerate(pos_ids)}
+
+        value = (body.get("result") or {}).get("value") or []
+        if len(value) != len(positions):
+            # Malformed: response should have exactly N entries
+            err = f"batch response had {len(value)} entries, expected {len(positions)}"
+            return {pid: _MarkResult(pdas[i], None, err) for i, pid in enumerate(pos_ids)}
+    except Exception as e:
+        err = f"batch fetch failed: {type(e).__name__}: {e}"
+        return {pid: _MarkResult(pdas[i], None, err) for i, pid in enumerate(pos_ids)}
+
+    # SOL/USD once per batch (cached anyway, but no point calling it N times)
+    sol_usd = await _get_sol_usd(client, rpc_url)
+
+    out: dict[int, _MarkResult] = {}
+    for i, (pos_id, pda, entry) in enumerate(zip(pos_ids, pdas, value)):
+        if entry is None:
+            out[pos_id] = _MarkResult(pda, None, "bonding curve not found")
+            continue
+        try:
+            data_b64 = entry.get("data", [None])[0]
+            if not data_b64:
+                out[pos_id] = _MarkResult(pda, None, "empty curve data")
+                continue
+            data = base64.b64decode(data_b64)
+            if len(data) < 49:
+                out[pos_id] = _MarkResult(pda, None, f"curve too short: {len(data)} bytes")
+                continue
+
+            v_tokens = int.from_bytes(data[8:16], "little")
+            v_sol = int.from_bytes(data[16:24], "little")
+            complete = bool(data[48])
+
+            if complete:
+                out[pos_id] = _MarkResult(pda, None, "bonding curve complete (graduated)")
+                continue
+            if v_tokens == 0:
+                out[pos_id] = _MarkResult(pda, None, "zero token reserves")
+                continue
+
+            sol_per_token = (v_sol / LAMPORTS_PER_SOL) / (v_tokens / (10 ** PUMPFUN_TOKEN_DECIMALS))
+            price_usd = sol_per_token * sol_usd
+
+            if price_usd <= 0:
+                out[pos_id] = _MarkResult(pda, None, "zero price computed")
+            else:
+                out[pos_id] = _MarkResult(pda, price_usd)
+        except Exception as e:
+            out[pos_id] = _MarkResult(pda, None, f"{type(e).__name__}: {e}")
+
+    return out
+
+
 async def fetch_position_prices(positions: list[dict]) -> dict[int, float]:
     """Given a list of open position dicts with id/chain/pool_address/address,
     return {position_id: current_price_usd}. Positions whose price couldn't
     be fetched (RPC error, missing config, decoder fail) are omitted from
-    the result — caller should hold the previous mark for those."""
+    the result — caller should hold the previous mark for those.
+
+    RPC routing: pump.fun bonding-curve reads are the highest-volume
+    sustained traffic in this system. To avoid blowing free-tier quotas
+    on the scanner's RPC (Helius), the price oracle can use a separate
+    RPC via SOL_PRICE_RPC_URL. Falls back to SOL_HTTP_URL if unset, and
+    finally to the public Solana RPC if neither is configured. EVM and
+    Raydium reads still use their dedicated RPC env vars.
+    """
     if not positions:
         return {}
 
     eth_rpc = _os.getenv("ETH_HTTP_URL", "")
     sol_rpc = _os.getenv("SOL_HTTP_URL", "")
-    if not eth_rpc and not sol_rpc:
+    # Price-oracle traffic goes here. If unset, fall back to the scanner
+    # RPC; if that's also unset, try Solana's free public RPC. The latter
+    # is heavily throttled by IP, but better than nothing for paper trading.
+    sol_price_rpc = (
+        _os.getenv("SOL_PRICE_RPC_URL")
+        or sol_rpc
+        or "https://api.mainnet-beta.solana.com"
+    )
+    if not eth_rpc and not sol_rpc and not _os.getenv("SOL_PRICE_RPC_URL"):
         return {}
 
     import asyncio
+
+    # Partition positions by routing path so the batched pump.fun call can
+    # be made independently of the per-position EVM/Raydium fetchers.
+    pumpfun_positions = []
+    other_tasks = []
+    other_meta = []
+
     async with httpx.AsyncClient(timeout=6.0) as client:
-        tasks = []
-        meta = []
         for p in positions:
             chain = (p.get("chain") or "").upper()
             pool = p.get("pool_address") or p.get("poolAddress")
@@ -483,43 +595,57 @@ async def fetch_position_prices(positions: list[dict]) -> dict[int, float]:
                 continue
             if chain == "ETH" and eth_rpc:
                 quote = p.get("quote_address") or _WETH_LC
-                tasks.append(_fetch_evm_price(client, eth_rpc, pool, tok, quote))
-                meta.append(p["id"])
-            elif chain == "SOL" and sol_rpc:
-                # Route to pump.fun reader when dex is explicitly pumpfun,
-                # otherwise default to the Raydium V4 path. Old positions
-                # without a dex field stored fall through to Raydium —
-                # safe default since pumpfun is a newer feature.
+                other_tasks.append(_fetch_evm_price(client, eth_rpc, pool, tok, quote))
+                other_meta.append(p["id"])
+            elif chain == "SOL":
                 if dex == "pumpfun":
-                    tasks.append(_fetch_pumpfun_price(client, sol_rpc, pool))
-                else:
-                    tasks.append(_fetch_solana_price(client, sol_rpc, pool, tok))
-                meta.append(p["id"])
+                    pumpfun_positions.append(p)
+                elif sol_rpc:
+                    # Raydium path: keep on scanner RPC (lower volume,
+                    # only fires for trending/non-pumpfun Solana positions)
+                    other_tasks.append(_fetch_solana_price(client, sol_rpc, pool, tok))
+                    other_meta.append(p["id"])
 
-        if not tasks:
+        if not pumpfun_positions and not other_tasks:
             return {}
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Fire both paths concurrently
+        pumpfun_task = (
+            _fetch_pumpfun_prices_batched(client, sol_price_rpc, pumpfun_positions)
+            if pumpfun_positions else asyncio.sleep(0, result={})
+        )
+        if other_tasks:
+            other_results, pumpfun_results = await asyncio.gather(
+                asyncio.gather(*other_tasks, return_exceptions=True),
+                pumpfun_task,
+            )
+        else:
+            pumpfun_results = await pumpfun_task
+            other_results = []
 
+    # Stitch together
     out: dict[int, float] = {}
     errors: list[tuple[int, str]] = []
     exceptions = 0
-    for pos_id, r in zip(meta, results):
+
+    # pump.fun batched results
+    for pos_id, r in pumpfun_results.items():
+        if r.price_usd is not None and r.price_usd > 0:
+            out[pos_id] = r.price_usd
+        else:
+            errors.append((pos_id, r.error or "no reason"))
+
+    # EVM/Raydium per-position results
+    for pos_id, r in zip(other_meta, other_results):
         if isinstance(r, _MarkResult) and r.price_usd is not None and r.price_usd > 0:
             out[pos_id] = r.price_usd
         elif isinstance(r, _MarkResult):
             errors.append((pos_id, r.error or "no reason"))
         else:
-            # gather() returned an exception instance
             exceptions += 1
             errors.append((pos_id, f"exception: {type(r).__name__}: {r}"))
 
-    # Visibility for the Railway log: one INFO line per refresh with the
-    # success/failure counts, plus WARNING for the first few error reasons.
-    # Why bother: silent failures in this loop were invisible for weeks
-    # and let random-walk drift run the whole bot. Now if the oracle
-    # silently breaks again, the log will show it.
-    n_total = len(tasks)
+    n_total = len(pumpfun_positions) + len(other_tasks)
     if n_total == 0:
         pass
     elif len(out) == n_total:
@@ -530,8 +656,6 @@ async def fetch_position_prices(positions: list[dict]) -> dict[int, float]:
             len(out), n_total, len(errors),
             f", {exceptions} exceptions" if exceptions else "",
         )
-        # Surface the first few error reasons so the log isn't flooded
-        # if all 20 positions fail with the same RPC error
         for pos_id, reason in errors[:3]:
             log.warning("  pos=%d: %s", pos_id, reason)
         if len(errors) > 3:
