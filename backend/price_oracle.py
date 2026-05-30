@@ -142,7 +142,7 @@ _USD_HINTS = {
 }
 _WETH_LC = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
 _WSOL    = "So11111111111111111111111111111111111111112"
-SOL_USD_FALLBACK = 180.0  # rough recent; engine TP/SL is %-based so absolute error is bounded
+SOL_USD_FALLBACK = 85.0  # rough recent (May 2026); Jupiter is the live source. Update periodically.
 
 
 @_dataclass
@@ -261,80 +261,72 @@ async def _fetch_solana_price(client, rpc_url, pool, token) -> _MarkResult:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Pyth SOL/USD oracle (cached)
+# SOL/USD oracle (Jupiter price API, cached)
 # ─────────────────────────────────────────────────────────────────────────────
-# Pyth publishes a SOL/USD price feed at a well-known Solana account.
-# We read it via getAccountInfo and decode the price field. Cached for 60s
-# since SOL price doesn't move enough to need sub-minute precision for
-# paper-trading marks.
+# Previously we read Pyth's old v1 SOL/USD account directly. Pyth has since
+# migrated to a "receiver" architecture where the price isn't at a fixed
+# address — it's at a PDA derived from a feed ID + shard ID. Implementing
+# that derivation correctly is non-trivial (involves their SDK).
 #
-# Pyth account layout reference:
-#   https://docs.pyth.network/price-feeds/how-pyth-works/account-types
-# The 'price' field lives at offset 208 (signed i64) and 'expo' at 216
-# (signed i32). Final price = price * 10^expo (expo is usually -8 for USD pairs).
+# Simpler approach: Jupiter's public price API. Same data, just HTTP. The
+# endpoint is unauthenticated, low-latency, and Jupiter is the dominant
+# Solana DEX aggregator, so this is well-maintained infrastructure.
+#
+# Cached 60s — SOL/USD doesn't move enough to need sub-minute precision
+# for paper-trading marks. On any failure, fall back to a hardcoded value
+# that's roughly current. Log the failure at INFO so it's visible the
+# first time it happens (and not flooding on subsequent failures because
+# of the cache).
 
-PYTH_SOL_USD_FEED = "H6ARHf6YXhGYeQfUzQNGk6rDNnLBQKrenN712K4AQJEG"
-_PYTH_PRICE_OFFSET = 208
-_PYTH_EXPO_OFFSET = 216
-_SOL_USD_CACHE = {"value": None, "fetched_at": 0.0}
-_SOL_USD_CACHE_TTL = 60.0  # seconds
+JUPITER_PRICE_URL = "https://price.jup.ag/v6/price?ids=SOL"
+SOL_USD_CACHE_TTL = 60.0  # seconds
+_SOL_USD_CACHE = {"value": None, "fetched_at": 0.0, "logged_fail": False}
 
 
 async def _get_sol_usd(client, rpc_url) -> float:
-    """Returns current SOL/USD price. Falls back to a hardcoded value on
-    any failure rather than blocking the price refresh — engine TP/SL is
-    %-based so absolute USD error is bounded."""
+    """Return current SOL/USD price.
+
+    The `client` parameter is the existing httpx.AsyncClient from the
+    caller; `rpc_url` is unused now (kept for API compatibility with the
+    old Pyth-on-Solana implementation). On any failure, returns
+    SOL_USD_FALLBACK and logs a warning the first time.
+    """
     import time
     now = time.time()
-    cached_val = _SOL_USD_CACHE["value"]
-    cached_at = _SOL_USD_CACHE["fetched_at"]
-    if cached_val is not None and (now - cached_at) < _SOL_USD_CACHE_TTL:
-        return cached_val
+    cached = _SOL_USD_CACHE["value"]
+    if cached is not None and (now - _SOL_USD_CACHE["fetched_at"]) < SOL_USD_CACHE_TTL:
+        return cached
 
     try:
-        import base64
-        resp = await client.post(rpc_url, json={
-            "jsonrpc": "2.0", "id": 1,
-            "method": "getAccountInfo",
-            "params": [PYTH_SOL_USD_FEED, {"encoding": "base64"}],
-        })
+        resp = await client.get(JUPITER_PRICE_URL)
+        if resp.status_code != 200:
+            raise ValueError(f"HTTP {resp.status_code}")
         body = resp.json()
-        value = (body.get("result") or {}).get("value")
-        if not value:
-            log.warning("pyth SOL/USD: account not found, using fallback")
-            return SOL_USD_FALLBACK
-        data_b64 = value.get("data", [None])[0]
-        if not data_b64:
-            return SOL_USD_FALLBACK
-        data = base64.b64decode(data_b64)
-
-        # Need at least 220 bytes to read both price and expo
-        if len(data) < 220:
-            log.warning("pyth SOL/USD: unexpected account size %d", len(data))
-            return SOL_USD_FALLBACK
-
-        # Signed little-endian i64 + i32
-        price_raw = int.from_bytes(
-            data[_PYTH_PRICE_OFFSET:_PYTH_PRICE_OFFSET + 8],
-            "little", signed=True,
-        )
-        expo = int.from_bytes(
-            data[_PYTH_EXPO_OFFSET:_PYTH_EXPO_OFFSET + 4],
-            "little", signed=True,
-        )
-        price = price_raw * (10 ** expo)
-
-        # Sanity: SOL/USD should be in a plausible range
+        # Jupiter v6 shape: {"data": {"SOL": {"price": "164.83", ...}}}
+        price_raw = body.get("data", {}).get("SOL", {}).get("price")
+        if price_raw is None:
+            raise ValueError("missing price field")
+        price = float(price_raw)
         if not (10 < price < 10000):
-            log.warning("pyth SOL/USD: price %.4f out of plausible range", price)
-            return SOL_USD_FALLBACK
+            raise ValueError(f"price {price} outside plausible range")
 
         _SOL_USD_CACHE["value"] = price
         _SOL_USD_CACHE["fetched_at"] = now
-        log.debug("pyth SOL/USD updated: $%.2f", price)
+        _SOL_USD_CACHE["logged_fail"] = False
+        log.debug("SOL/USD updated from Jupiter: $%.2f", price)
         return price
     except Exception as e:
-        log.warning("pyth SOL/USD read failed: %s — using fallback", e)
+        # Log only the first failure to avoid flooding; cached fallback
+        # quietly serves subsequent calls within TTL.
+        if not _SOL_USD_CACHE["logged_fail"]:
+            log.warning("Jupiter SOL/USD fetch failed: %s — using fallback $%.0f",
+                        e, SOL_USD_FALLBACK)
+            _SOL_USD_CACHE["logged_fail"] = True
+        # Cache the fallback briefly so we don't hammer Jupiter on repeated
+        # outages. 30s is a compromise: short enough to recover quickly,
+        # long enough not to flood.
+        _SOL_USD_CACHE["value"] = SOL_USD_FALLBACK
+        _SOL_USD_CACHE["fetched_at"] = now - (SOL_USD_CACHE_TTL - 30.0)
         return SOL_USD_FALLBACK
 
 
@@ -473,9 +465,39 @@ async def fetch_position_prices(positions: list[dict]) -> dict[int, float]:
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
     out: dict[int, float] = {}
+    errors: list[tuple[int, str]] = []
+    exceptions = 0
     for pos_id, r in zip(meta, results):
         if isinstance(r, _MarkResult) and r.price_usd is not None and r.price_usd > 0:
             out[pos_id] = r.price_usd
         elif isinstance(r, _MarkResult):
-            log.debug("price fetch failed pos=%d: %s", pos_id, r.error)
+            errors.append((pos_id, r.error or "no reason"))
+        else:
+            # gather() returned an exception instance
+            exceptions += 1
+            errors.append((pos_id, f"exception: {type(r).__name__}: {r}"))
+
+    # Visibility for the Railway log: one INFO line per refresh with the
+    # success/failure counts, plus WARNING for the first few error reasons.
+    # Why bother: silent failures in this loop were invisible for weeks
+    # and let random-walk drift run the whole bot. Now if the oracle
+    # silently breaks again, the log will show it.
+    n_total = len(tasks)
+    if n_total == 0:
+        pass
+    elif len(out) == n_total:
+        log.info("price oracle: refreshed %d/%d positions", len(out), n_total)
+    else:
+        log.warning(
+            "price oracle: refreshed %d/%d positions (%d failures%s)",
+            len(out), n_total, len(errors),
+            f", {exceptions} exceptions" if exceptions else "",
+        )
+        # Surface the first few error reasons so the log isn't flooded
+        # if all 20 positions fail with the same RPC error
+        for pos_id, reason in errors[:3]:
+            log.warning("  pos=%d: %s", pos_id, reason)
+        if len(errors) > 3:
+            log.warning("  ... and %d more failures with similar reasons",
+                        len(errors) - 3)
     return out

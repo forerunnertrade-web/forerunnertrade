@@ -26,7 +26,7 @@ import signal
 
 import uvicorn
 
-from alerts import app as fastapi_app, broadcast_metrics, broadcast_trending, dispatch_alert
+from alerts import app as fastapi_app, broadcast_metrics, broadcast_pool_event, broadcast_trending, dispatch_alert
 from auditor import quick_audit
 from config import load_config
 from scanners.base import PoolEvent
