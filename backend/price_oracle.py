@@ -261,35 +261,81 @@ async def _fetch_solana_price(client, rpc_url, pool, token) -> _MarkResult:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SOL/USD oracle (Jupiter price API, cached)
+# SOL/USD oracle (Jupiter lite-api + DEXScreener fallback, cached)
 # ─────────────────────────────────────────────────────────────────────────────
 # Previously we read Pyth's old v1 SOL/USD account directly. Pyth has since
 # migrated to a "receiver" architecture where the price isn't at a fixed
 # address — it's at a PDA derived from a feed ID + shard ID. Implementing
-# that derivation correctly is non-trivial (involves their SDK).
+# that derivation correctly is non-trivial.
 #
-# Simpler approach: Jupiter's public price API. Same data, just HTTP. The
-# endpoint is unauthenticated, low-latency, and Jupiter is the dominant
-# Solana DEX aggregator, so this is well-maintained infrastructure.
+# Simpler approach: Jupiter's public lite-api. They deprecated the old
+# `price.jup.ag` domain (DNS for it is now broken from many networks
+# including Railway); the current endpoint is `lite-api.jup.ag/price/v3`.
 #
-# Cached 60s — SOL/USD doesn't move enough to need sub-minute precision
-# for paper-trading marks. On any failure, fall back to a hardcoded value
-# that's roughly current. Log the failure at INFO so it's visible the
-# first time it happens (and not flooding on subsequent failures because
-# of the cache).
+# Belt-and-suspenders: if Jupiter fails, fall back to DEXScreener's
+# WSOL price (we already know DEXScreener is reachable from Railway —
+# our trending poller uses it successfully). Only fall through to the
+# hardcoded constant if BOTH sources fail.
+#
+# Cache 60s — SOL/USD doesn't move enough to need sub-minute precision.
 
-JUPITER_PRICE_URL = "https://price.jup.ag/v6/price?ids=SOL"
+_WSOL_MINT = "So11111111111111111111111111111111111111112"
+JUPITER_PRICE_URL = f"https://lite-api.jup.ag/price/v3?ids={_WSOL_MINT}"
+DEXSCREENER_WSOL_URL = f"https://api.dexscreener.com/latest/dex/tokens/{_WSOL_MINT}"
 SOL_USD_CACHE_TTL = 60.0  # seconds
 _SOL_USD_CACHE = {"value": None, "fetched_at": 0.0, "logged_fail": False}
+
+
+async def _fetch_sol_usd_jupiter(client) -> float:
+    """Try Jupiter lite-api. Returns price or raises."""
+    r = await client.get(JUPITER_PRICE_URL)
+    if r.status_code != 200:
+        raise ValueError(f"HTTP {r.status_code}")
+    body = r.json()
+    # Jupiter v3 shape: { "So11...": { "usdPrice": "164.83", ... } }
+    entry = body.get(_WSOL_MINT)
+    if not entry:
+        raise ValueError("missing mint key in response")
+    price_raw = entry.get("usdPrice")
+    if price_raw is None:
+        raise ValueError("missing usdPrice field")
+    price = float(price_raw)
+    if not (10 < price < 10000):
+        raise ValueError(f"price {price} outside plausible range")
+    return price
+
+
+async def _fetch_sol_usd_dexscreener(client) -> float:
+    """DEXScreener fallback: read WSOL across all pairs, pick highest-liquidity priceUsd."""
+    r = await client.get(DEXSCREENER_WSOL_URL)
+    if r.status_code != 200:
+        raise ValueError(f"HTTP {r.status_code}")
+    body = r.json()
+    pairs = body.get("pairs") or []
+    if not pairs:
+        raise ValueError("no pairs returned")
+    # Pick highest-liquidity pair to avoid manipulated micropool prices
+    pairs.sort(
+        key=lambda p: float((p.get("liquidity") or {}).get("usd", 0) or 0),
+        reverse=True,
+    )
+    price_raw = pairs[0].get("priceUsd")
+    if price_raw is None:
+        raise ValueError("missing priceUsd")
+    price = float(price_raw)
+    if not (10 < price < 10000):
+        raise ValueError(f"price {price} outside plausible range")
+    return price
 
 
 async def _get_sol_usd(client, rpc_url) -> float:
     """Return current SOL/USD price.
 
-    The `client` parameter is the existing httpx.AsyncClient from the
-    caller; `rpc_url` is unused now (kept for API compatibility with the
-    old Pyth-on-Solana implementation). On any failure, returns
-    SOL_USD_FALLBACK and logs a warning the first time.
+    Tries Jupiter (lite-api) first, falls back to DEXScreener, then to the
+    hardcoded constant. Caches the result for SOL_USD_CACHE_TTL seconds.
+    Logs WARNING only on the first failure so production logs aren't
+    flooded — subsequent failures within the TTL serve cached fallback
+    silently.
     """
     import time
     now = time.time()
@@ -297,37 +343,28 @@ async def _get_sol_usd(client, rpc_url) -> float:
     if cached is not None and (now - _SOL_USD_CACHE["fetched_at"]) < SOL_USD_CACHE_TTL:
         return cached
 
-    try:
-        resp = await client.get(JUPITER_PRICE_URL)
-        if resp.status_code != 200:
-            raise ValueError(f"HTTP {resp.status_code}")
-        body = resp.json()
-        # Jupiter v6 shape: {"data": {"SOL": {"price": "164.83", ...}}}
-        price_raw = body.get("data", {}).get("SOL", {}).get("price")
-        if price_raw is None:
-            raise ValueError("missing price field")
-        price = float(price_raw)
-        if not (10 < price < 10000):
-            raise ValueError(f"price {price} outside plausible range")
+    errors = []
+    for name, fn in (("Jupiter", _fetch_sol_usd_jupiter),
+                     ("DEXScreener", _fetch_sol_usd_dexscreener)):
+        try:
+            price = await fn(client)
+            _SOL_USD_CACHE["value"] = price
+            _SOL_USD_CACHE["fetched_at"] = now
+            _SOL_USD_CACHE["logged_fail"] = False
+            log.debug("SOL/USD updated from %s: $%.2f", name, price)
+            return price
+        except Exception as e:
+            errors.append(f"{name}: {type(e).__name__}: {e}")
 
-        _SOL_USD_CACHE["value"] = price
-        _SOL_USD_CACHE["fetched_at"] = now
-        _SOL_USD_CACHE["logged_fail"] = False
-        log.debug("SOL/USD updated from Jupiter: $%.2f", price)
-        return price
-    except Exception as e:
-        # Log only the first failure to avoid flooding; cached fallback
-        # quietly serves subsequent calls within TTL.
-        if not _SOL_USD_CACHE["logged_fail"]:
-            log.warning("Jupiter SOL/USD fetch failed: %s — using fallback $%.0f",
-                        e, SOL_USD_FALLBACK)
-            _SOL_USD_CACHE["logged_fail"] = True
-        # Cache the fallback briefly so we don't hammer Jupiter on repeated
-        # outages. 30s is a compromise: short enough to recover quickly,
-        # long enough not to flood.
-        _SOL_USD_CACHE["value"] = SOL_USD_FALLBACK
-        _SOL_USD_CACHE["fetched_at"] = now - (SOL_USD_CACHE_TTL - 30.0)
-        return SOL_USD_FALLBACK
+    # Both sources failed
+    if not _SOL_USD_CACHE["logged_fail"]:
+        log.warning("SOL/USD: all sources failed (%s) — using fallback $%.0f",
+                    "; ".join(errors), SOL_USD_FALLBACK)
+        _SOL_USD_CACHE["logged_fail"] = True
+    # Cache fallback briefly so we don't hammer external APIs on outages
+    _SOL_USD_CACHE["value"] = SOL_USD_FALLBACK
+    _SOL_USD_CACHE["fetched_at"] = now - (SOL_USD_CACHE_TTL - 30.0)
+    return SOL_USD_FALLBACK
 
 
 # ─────────────────────────────────────────────────────────────────────────────
