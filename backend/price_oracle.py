@@ -488,7 +488,7 @@ async def _fetch_pumpfun_prices_batched(
     try:
         resp = await client.post(rpc_url, json={
             "jsonrpc": "2.0", "id": 1,
-            "method": "getMultipleAccountsInfo",
+            "method": "getMultipleAccounts",
             "params": [pdas, {"encoding": "base64"}],
         })
         body = resp.json()
