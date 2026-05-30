@@ -153,6 +153,13 @@ class SimulationEngine:
             "takeProfitPct": 25,
             "stopLossPct": 10,
             "maxConcurrent": 5,
+            # Slippage modeling. When True, pump.fun fills use the AMM
+            # constant-product math + 1% protocol fee for both buys and
+            # sells. This makes paper P&L match what real execution would
+            # produce. When False, fills happen at the quoted spot price
+            # (the old behavior — unrealistic for live trading).
+            # Default is True: there's no honest case for the old behavior.
+            "modelSlippage": True,
         }
 
         # Signal queue — populated by scanners via add_signal()
@@ -168,6 +175,30 @@ class SimulationEngine:
         n = self._next_id
         self._next_id += 1
         return n
+
+    def _cached_sol_usd(self) -> float:
+        """Return last-known SOL/USD without making an HTTP call.
+
+        The price oracle module maintains a 60-second cache populated by
+        every price refresh. On the open path we need this value to back
+        out bonding-curve reserves for slippage math, but we can't make a
+        blocking HTTP call inside the lock — fetching SOL/USD on the open
+        path could add 4+ seconds of latency.
+
+        If the cache is empty (engine just started, no refresh yet),
+        falls back to the hardcoded constant from price_oracle. That
+        constant is updated periodically by hand; it's not perfect but
+        bounded ~$10-20 of error, which doesn't materially change
+        slippage % at typical position sizes.
+        """
+        try:
+            from price_oracle import _SOL_USD_CACHE, SOL_USD_FALLBACK
+            v = _SOL_USD_CACHE.get("value")
+            if v is not None and v > 0:
+                return v
+            return SOL_USD_FALLBACK
+        except Exception:
+            return 85.0  # absolute last resort
 
     # ─── Hydration ────────────────────────────────────────────────────────────
     async def hydrate(self) -> None:
@@ -401,14 +432,43 @@ class SimulationEngine:
                 pos = self.positions.pop(pos_id)
                 # Drop any cached oracle price for this closed position
                 self._latest_prices.pop(pos_id, None)
-                proceeds = pos.qty * pos.mark_px
+
+                # Apply sell-side slippage on pump.fun. pos.mark_px is the
+                # pre-trade spot from the oracle; our sell moves the curve
+                # down, so the effective exit price is lower. Without this,
+                # paper P&L overstates realistic returns — especially for
+                # rugged positions where v_sol is shallow at exit.
+                if (self.params.get("modelSlippage", True)
+                        and pos.dex == "pumpfun"
+                        and pos.mark_px > 0
+                        and pos.qty > 0):
+                    from slippage import simulate_sell
+                    sol_usd = self._cached_sol_usd()
+                    fill = simulate_sell(pos.mark_px, pos.qty, sol_usd)
+                    if fill.quantity > 0:
+                        proceeds = fill.quantity
+                        exit_px = fill.effective_price
+                    else:
+                        # Sim failed — fall back to naive proceeds rather
+                        # than refusing to close (the position MUST exit).
+                        # Log the failure so it's visible.
+                        log.warning(
+                            "CLOSE slippage sim failed for %s — using naive proceeds",
+                            pos.symbol
+                        )
+                        proceeds = pos.qty * pos.mark_px
+                        exit_px = pos.mark_px
+                else:
+                    proceeds = pos.qty * pos.mark_px
+                    exit_px = pos.mark_px
+
                 self.cash += proceeds
-                pnl_usd = (pos.mark_px - pos.entry_px) * pos.qty
-                pnl_pct = ((pos.mark_px - pos.entry_px) / pos.entry_px) * 100
+                pnl_usd = proceeds - (pos.qty * pos.entry_px)
+                pnl_pct = ((exit_px - pos.entry_px) / pos.entry_px) * 100
                 trade = Trade(
                     id=self._next(),
                     chain=pos.chain, symbol=pos.symbol, address=pos.address,
-                    qty=pos.qty, entry_px=pos.entry_px, exit_px=pos.mark_px,
+                    qty=pos.qty, entry_px=pos.entry_px, exit_px=exit_px,
                     pnl_usd=pnl_usd, pnl_pct=pnl_pct, reason=reason,
                     opened_at=pos.opened_at, closed_at=now_ms,
                 )
@@ -434,9 +494,8 @@ class SimulationEngine:
                 except asyncio.QueueEmpty:
                     sig = None
                 if sig and self._signal_passes(sig):
-                    entry_px = float(sig.get("final_price_usd") or 1.0)
-                    if entry_px > 0:
-                        qty = self.params["positionSizeUsd"] / entry_px
+                    entry_spot = float(sig.get("final_price_usd") or 1.0)
+                    if entry_spot > 0:
                         # Map signal source → dex hint for the price oracle.
                         # pumpfun signals need to read bonding-curve PDA;
                         # scanner/trending signals on Solana hit Raydium V4.
@@ -447,38 +506,72 @@ class SimulationEngine:
                             dex_hint = "uniswap-v2"  # default EVM
                         else:
                             dex_hint = "raydium"
-                        pos = Position(
-                            id=self._next(),
-                            chain=sig.get("chain", "?"),
-                            symbol=sig.get("symbol", "?"),
-                            address=sig.get("address"),
-                            qty=qty,
-                            entry_px=entry_px,
-                            mark_px=entry_px,
-                            bias=0.0,  # live entries don't drift artificially
-                            tp_pct=self.params["takeProfitPct"],
-                            sl_pct=self.params["stopLossPct"],
-                            opened_at=now_ms,
-                            pool_address=sig.get("pool_address"),
-                            quote_address=sig.get("quote_address"),
-                            dex=dex_hint,
-                        )
-                        self.positions[pos.id] = pos
-                        self.cash -= self.params["positionSizeUsd"]
-                        position_set_dirty = True
-                        log.info(
-                            "OPEN %s %s qty=%.4f @ $%.6g",
-                            pos.chain, pos.symbol, qty, entry_px
-                        )
-                        # Mark the corresponding signal row as acted-on.
-                        # The signal's `pool_address` was set when the signal
-                        # was queued. chain normalization: signals table
-                        # stores internal names ("ethereum") not codes ("ETH"),
-                        # so map back via the same helper used in main.py.
-                        sig_pool = sig.get("pool_address")
-                        if sig_pool:
-                            opened_signal = (sig.get("chain", "?"), sig_pool, pos.id)
-                            opened_signals_in_tick.append(opened_signal)
+
+                        # Apply buy-side slippage on pump.fun. The signal's
+                        # final_price_usd is the pre-trade SPOT — our buy
+                        # moves the curve up, so the effective fill price is
+                        # higher and we receive fewer tokens than spot suggests.
+                        # Without this, paper P&L overstates real returns.
+                        size_usd = self.params["positionSizeUsd"]
+                        skip_open = False
+                        if self.params.get("modelSlippage", True) and dex_hint == "pumpfun":
+                            from slippage import simulate_buy
+                            # SOL/USD is needed to back out the curve reserves
+                            # from the spot price. Use the cached value from
+                            # the price oracle (set during the last refresh)
+                            # or the fallback if no cache yet.
+                            sol_usd = self._cached_sol_usd()
+                            fill = simulate_buy(entry_spot, size_usd, sol_usd)
+                            if fill.quantity > 0:
+                                qty = fill.quantity
+                                entry_px = fill.effective_price
+                            else:
+                                # Slippage sim failed (degenerate input) —
+                                # skip this signal rather than open at a
+                                # potentially wrong price
+                                log.warning(
+                                    "OPEN skipped: slippage sim returned 0 for %s "
+                                    "(spot=%.10g, sol_usd=%.2f)",
+                                    sig.get("symbol"), entry_spot, sol_usd
+                                )
+                                skip_open = True
+                        else:
+                            qty = size_usd / entry_spot
+                            entry_px = entry_spot
+
+                        if not skip_open:
+                            pos = Position(
+                                id=self._next(),
+                                chain=sig.get("chain", "?"),
+                                symbol=sig.get("symbol", "?"),
+                                address=sig.get("address"),
+                                qty=qty,
+                                entry_px=entry_px,
+                                mark_px=entry_px,
+                                bias=0.0,  # live entries don't drift artificially
+                                tp_pct=self.params["takeProfitPct"],
+                                sl_pct=self.params["stopLossPct"],
+                                opened_at=now_ms,
+                                pool_address=sig.get("pool_address"),
+                                quote_address=sig.get("quote_address"),
+                                dex=dex_hint,
+                            )
+                            self.positions[pos.id] = pos
+                            self.cash -= size_usd
+                            position_set_dirty = True
+                            log.info(
+                                "OPEN %s %s qty=%.4f @ $%.6g (spot=$%.6g)",
+                                pos.chain, pos.symbol, qty, entry_px, entry_spot
+                            )
+                            # Mark the corresponding signal row as acted-on.
+                            # The signal's `pool_address` was set when the signal
+                            # was queued. chain normalization: signals table
+                            # stores internal names ("ethereum") not codes ("ETH"),
+                            # so map back via the same helper used in main.py.
+                            sig_pool = sig.get("pool_address")
+                            if sig_pool:
+                                opened_signal = (sig.get("chain", "?"), sig_pool, pos.id)
+                                opened_signals_in_tick.append(opened_signal)
 
             # ── 4. Equity snapshot ──────────────────────────────────────────
             open_value = sum(p.qty * p.mark_px for p in self.positions.values())
