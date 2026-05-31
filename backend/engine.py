@@ -160,6 +160,14 @@ class SimulationEngine:
             # (the old behavior — unrealistic for live trading).
             # Default is True: there's no honest case for the old behavior.
             "modelSlippage": True,
+            # Skip pump.fun signals where the deployer's initial buy was
+            # between 0.5 and 1 SOL. Round-14 analysis of 526 trades found
+            # this bucket lost $420 across 65 trades (avg -32% pnl, 6.2%
+            # win rate, permutation test p=0.0002). Hypothesis: small but
+            # non-trivial dev buys signal a snipe-and-dump pattern — the
+            # deployer test-buys their token with intent to dump near
+            # launch. Default ON. Set to False to disable for A/B.
+            "skipDevBracketSol": True,
         }
 
         # Signal queue — populated by scanners via add_signal()
@@ -741,6 +749,16 @@ class SimulationEngine:
             if p["minBuyers"] > 0 and (buyers is None or buyers < p["minBuyers"]):
                 return False
             if p["requireBreakout"] and not sig.get("breakout_triggered"):
+                return False
+
+        # Pump.fun dev-bracket filter. Round-14 analysis showed that signals
+        # where the deployer's initial buy was 0.5-1 SOL had a 6.2% win rate
+        # and -32% avg P&L across 65 trades (p=0.0002 vs random subsamples).
+        # We don't punish for missing data — if dev_initial_buy_sol isn't
+        # in the payload, the filter doesn't apply. Only applies to pump.fun.
+        if source == "pumpfun" and p.get("skipDevBracketSol", True):
+            dev_sol = sig.get("dev_initial_buy_sol")
+            if dev_sol is not None and 0.5 <= dev_sol < 1.0:
                 return False
 
         return True

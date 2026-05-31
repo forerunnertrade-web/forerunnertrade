@@ -347,15 +347,16 @@ async def on_pumpfun_launch(event: PoolEvent) -> None:
     # Math: PumpPortal's vSolInBondingCurve reflects the curve state AFTER
     # the dev's initial buy (if any). Standard pump.fun launch has 30 SOL
     # virtual reserves; anything above that is the dev's contribution.
-    # initialBuy field is in token base units (×10^6 for pump.fun's 6
-    # decimals); standard total supply is 1B tokens.
+    # PumpPortal sends initialBuy in WHOLE TOKENS (NOT base units / 10^6 —
+    # verified empirically against the AMM math: the field value times
+    # exactly 1 produces the expected % of supply per constant-product).
+    # Standard total supply is 1B tokens.
     v_sol_post = float(raw.get("vSolInBondingCurve") or 0)
-    initial_buy_base = raw.get("initialBuy") or 0
+    initial_buy_tokens = raw.get("initialBuy") or 0  # whole tokens, not base units
     PUMPFUN_BASE_V_SOL = 30.0
     PUMPFUN_TOTAL_SUPPLY = 1_000_000_000  # whole tokens
     dev_sol = max(0.0, v_sol_post - PUMPFUN_BASE_V_SOL) if v_sol_post > 0 else None
-    dev_tokens_whole = (initial_buy_base / 1_000_000) if initial_buy_base else 0
-    dev_pct = (dev_tokens_whole / PUMPFUN_TOTAL_SUPPLY * 100) if dev_tokens_whole > 0 else None
+    dev_pct = (initial_buy_tokens / PUMPFUN_TOTAL_SUPPLY * 100) if initial_buy_tokens > 0 else None
     # Floor at 0 if we have a positive vSol but no initialBuy (defensive):
     if dev_sol is None and v_sol_post > 0:
         dev_sol = 0.0
@@ -392,7 +393,8 @@ async def on_pumpfun_launch(event: PoolEvent) -> None:
         price_usd = (market_cap_usd / 1_000_000_000) if market_cap_usd else 0.0
 
     # Feed the engine. Trending-style payload — no breakout/buyer data,
-    # source-aware filter will skip those checks.
+    # source-aware filter will skip those checks. Include dev_initial_buy_sol
+    # so the engine's pump.fun dev-bracket filter can use it.
     from engine import engine
     await engine.add_signal({
         "chain": "SOL",
@@ -407,6 +409,7 @@ async def on_pumpfun_launch(event: PoolEvent) -> None:
         "final_price_usd": price_usd,
         "breakout_triggered": None,
         "source": "pumpfun",
+        "dev_initial_buy_sol": dev_sol,  # for the dev-bracket filter
     })
 
     # Also broadcast over WS so the dashboard's Live Signals panel shows
