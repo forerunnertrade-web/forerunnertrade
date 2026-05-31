@@ -391,6 +391,13 @@ async def upsert_signal_phase1(
     token_address: str, quote_address: Optional[str],
     symbol: Optional[str],
     audit_passed: bool, audit_score: int, audit_reason: str,
+    # Optional pump.fun-specific fields. Captured at signal time from the
+    # PumpPortal payload. Used later for filter analysis (which deployer
+    # patterns correlate with profitable vs rugged trades) and eventually
+    # to drive a "skip if dev took >X% of supply" filter.
+    dev_address: Optional[str] = None,
+    dev_initial_buy_sol: Optional[float] = None,
+    dev_pct_supply: Optional[float] = None,
 ) -> bool:
     """Record the audit phase. Idempotent on (user, chain, pool_address) —
     if the same pool is detected twice, the second call is a no-op rather
@@ -408,6 +415,14 @@ async def upsert_signal_phase1(
         "audit_score": audit_score,
         "audit_reason": audit_reason,
     }
+    # Only include dev fields when they're populated, so non-pump.fun
+    # signals don't carry null pump.fun-specific columns in their POST body.
+    if dev_address is not None:
+        row["dev_address"] = dev_address
+    if dev_initial_buy_sol is not None:
+        row["dev_initial_buy_sol"] = dev_initial_buy_sol
+    if dev_pct_supply is not None:
+        row["dev_pct_supply"] = dev_pct_supply
     resp = await _request(
         "POST", "/signals",
         json=row,

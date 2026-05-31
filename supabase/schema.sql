@@ -277,3 +277,14 @@ ALTER TABLE positions ADD COLUMN IF NOT EXISTS quote_address TEXT;
 -- ─── Positions: add dex hint so the price oracle knows which AMM to read ────
 -- "pumpfun" → bonding-curve PDA, "raydium" → V4 pool vaults, "uniswap-v2" → V2 reserves.
 ALTER TABLE positions ADD COLUMN IF NOT EXISTS dex TEXT;
+
+-- ─── Signals: capture pump.fun deployer info for filter analysis ────────────
+-- Persisting these fields on every pump.fun signal lets us analyze ex-post
+-- which deployer patterns correlate with profitable trades vs rugs. Once we
+-- know where the bimodal distribution splits, this powers a filter like
+-- "skip when dev_pct_supply > X" in the engine.
+-- All three columns are nullable — non-pump.fun signals (trending, scanner)
+-- legitimately have no deployer info.
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS dev_address TEXT;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS dev_initial_buy_sol DOUBLE PRECISION;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS dev_pct_supply DOUBLE PRECISION;

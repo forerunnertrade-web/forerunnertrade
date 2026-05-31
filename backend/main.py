@@ -339,6 +339,29 @@ async def on_pumpfun_launch(event: PoolEvent) -> None:
     liq_usd = v_sol * SOL_USD
 
     # Persist phase-1 signal (auto-pass, score 100 for "trust pump.fun")
+    # Also capture dev/deployer metrics so we can analyze which launch
+    # patterns predict profitable trades vs rugs. Used later (next round)
+    # to drive a "skip if dev took >X% of supply" filter; for now just
+    # storing the data so we can analyze it ex-post.
+    #
+    # Math: PumpPortal's vSolInBondingCurve reflects the curve state AFTER
+    # the dev's initial buy (if any). Standard pump.fun launch has 30 SOL
+    # virtual reserves; anything above that is the dev's contribution.
+    # initialBuy field is in token base units (×10^6 for pump.fun's 6
+    # decimals); standard total supply is 1B tokens.
+    v_sol_post = float(raw.get("vSolInBondingCurve") or 0)
+    initial_buy_base = raw.get("initialBuy") or 0
+    PUMPFUN_BASE_V_SOL = 30.0
+    PUMPFUN_TOTAL_SUPPLY = 1_000_000_000  # whole tokens
+    dev_sol = max(0.0, v_sol_post - PUMPFUN_BASE_V_SOL) if v_sol_post > 0 else None
+    dev_tokens_whole = (initial_buy_base / 1_000_000) if initial_buy_base else 0
+    dev_pct = (dev_tokens_whole / PUMPFUN_TOTAL_SUPPLY * 100) if dev_tokens_whole > 0 else None
+    # Floor at 0 if we have a positive vSol but no initialBuy (defensive):
+    if dev_sol is None and v_sol_post > 0:
+        dev_sol = 0.0
+    if dev_pct is None and v_sol_post > 0:
+        dev_pct = 0.0
+
     import db
     if db.is_configured():
         asyncio.create_task(db.upsert_signal_phase1(
@@ -352,6 +375,9 @@ async def on_pumpfun_launch(event: PoolEvent) -> None:
             audit_passed=True,
             audit_score=100,
             audit_reason="pump.fun bonding curve (audit n/a)",
+            dev_address=event.deployer,
+            dev_initial_buy_sol=dev_sol,
+            dev_pct_supply=dev_pct,
         ))
 
     # Derive a per-token price from the bonding-curve numbers.
