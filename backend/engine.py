@@ -168,7 +168,26 @@ class SimulationEngine:
             # deployer test-buys their token with intent to dump near
             # launch. Default ON. Set to False to disable for A/B.
             "skipDevBracketSol": True,
+            # Skip pump.fun signals from deployers we've seen launch a
+            # token before in this session. Round-15+16 analysis of 1,938
+            # trades found a sharp cliff: first-time deployers had a 25%
+            # win rate and were net profitable, while any deployer with
+            # one or more prior launches in our dataset had a ~7-9% win
+            # rate and was strongly unprofitable (overall delta of +21.9
+            # pp in mean pnl%, permutation p<0.000001). Hypothesis: serial
+            # deployers are running launch-and-dump bots as a business
+            # model; the tokens are designed to extract value, not appreciate.
+            # Default ON. Set to False to disable for A/B.
+            "skipRepeatDev": True,
         }
+
+        # In-memory set of dev_address values we've ever seen send a pump.fun
+        # signal. Used by the skipRepeatDev filter. Survives engine lifetime
+        # but resets across process restarts (we accept some warm-up cost in
+        # exchange for not paying a DB round-trip on every signal).
+        # Could be hydrated from past signals on startup; deferred until we
+        # know whether this filter holds up empirically.
+        self._seen_devs: set[str] = set()
 
         # Signal queue — populated by scanners via add_signal()
         self._signals: asyncio.Queue = asyncio.Queue(maxsize=200)
@@ -751,6 +770,18 @@ class SimulationEngine:
             if p["requireBreakout"] and not sig.get("breakout_triggered"):
                 return False
 
+        # Pump.fun-specific filters: mark the deployer as seen FIRST (before
+        # any filter check), so a dev whose first signal is rejected (e.g.
+        # for being in the 0.5-1 SOL bracket) still poisons the well for
+        # their next launch. The question "have we seen this dev?" is about
+        # the wallet's behavior, not about whether we acted on past signals.
+        is_first_sighting = True  # default for non-pumpfun
+        if source == "pumpfun":
+            dev_addr = sig.get("dev_address")
+            if dev_addr:
+                is_first_sighting = dev_addr not in self._seen_devs
+                self._seen_devs.add(dev_addr)
+
         # Pump.fun dev-bracket filter. Round-14 analysis showed that signals
         # where the deployer's initial buy was 0.5-1 SOL had a 6.2% win rate
         # and -32% avg P&L across 65 trades (p=0.0002 vs random subsamples).
@@ -759,6 +790,13 @@ class SimulationEngine:
         if source == "pumpfun" and p.get("skipDevBracketSol", True):
             dev_sol = sig.get("dev_initial_buy_sol")
             if dev_sol is not None and 0.5 <= dev_sol < 1.0:
+                return False
+
+        # Pump.fun repeat-deployer filter. Already-computed is_first_sighting
+        # above tells us whether the dev_address was new at this signal's
+        # arrival. Reject if it's NOT a first sighting.
+        if source == "pumpfun" and p.get("skipRepeatDev", True):
+            if not is_first_sighting:
                 return False
 
         return True

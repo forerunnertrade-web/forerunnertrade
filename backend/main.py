@@ -410,6 +410,7 @@ async def on_pumpfun_launch(event: PoolEvent) -> None:
         "breakout_triggered": None,
         "source": "pumpfun",
         "dev_initial_buy_sol": dev_sol,  # for the dev-bracket filter
+        "dev_address": event.deployer,   # for the repeat-deployer filter
     })
 
     # Also broadcast over WS so the dashboard's Live Signals panel shows
