@@ -482,6 +482,104 @@ async def _fetch_pumpfun_price(client, rpc_url, bonding_curve_pda) -> _MarkResul
         return _MarkResult(bonding_curve_pda, None, f"{type(e).__name__}: {e}")
 
 
+DEXSCREENER_TOKENS_URL = "https://api.dexscreener.com/latest/dex/tokens/{mints}"
+
+
+async def _fetch_pumpfun_prices_dexscreener(
+    client, positions: list[dict]
+) -> dict[str, float]:
+    """Fallback price source: DEXScreener's off-chain indexer.
+
+    DEXScreener polls Solana via their own infrastructure and exposes the
+    result via HTTP. Their index is independent of any single RPC, so it
+    can succeed when every RPC we have access to is slot-lagged. For
+    tokens already indexed (typically true for tokens >5-10s old), they
+    return priceUsd directly.
+
+    Returns {token_address: priceUsd} for any positions DEXScreener has
+    indexed. Positions DEXScreener doesn't know about (still too fresh)
+    are simply absent from the result.
+
+    Why this fallback matters: round-19/20 data showed that even with
+    three RPC providers, the first 1-2 seconds of a pump.fun launch can
+    still be entirely invisible to RPC reads. DEXScreener won't help in
+    that very first second either, but for tokens at 5-30s of age it
+    often has data when RPCs still return null.
+
+    Caveats:
+    - DEXScreener's indexer is itself polling-based, so it's not real-time
+    - Price returned is from their last poll, which can be 10-30s stale
+    - During pump.fun graduation events the indexer can lag further
+    - Rate limit is 300 req/min on the free tier — plenty of headroom
+
+    For honesty: this is a "better than nothing" tier. Use only when the
+    RPC chain has fully failed. A successful DEXScreener read should
+    still be treated as a relatively stale price, which means our slippage
+    model will be applied to potentially-out-of-date spot. Live trading
+    would NOT use this — it's a paper-trading fallback that prevents
+    every fresh-launch trade from being skipped entirely.
+    """
+    if not positions:
+        return {}
+
+    # Extract token mints (NOT pool addresses — DEXScreener indexes by token)
+    mints = [p["address"] for p in positions if p.get("address")]
+    if not mints:
+        return {}
+
+    # DEXScreener's tokens endpoint accepts comma-separated mints up to 30
+    if len(mints) > 30:
+        mints = mints[:30]
+
+    url = DEXSCREENER_TOKENS_URL.format(mints=",".join(mints))
+    try:
+        resp = await client.get(url)
+    except Exception as e:
+        log.debug("DEXScreener fallback request failed: %s", e)
+        return {}
+    if resp.status_code != 200:
+        log.debug("DEXScreener fallback returned HTTP %d", resp.status_code)
+        return {}
+    try:
+        body = resp.json()
+    except Exception:
+        return {}
+
+    pairs = body.get("pairs") or []
+    if not pairs:
+        return {}
+
+    # For each mint, pick the highest-liquidity pair's priceUsd. A token
+    # may have multiple pairs (e.g. pumpfun bonding curve AND a Raydium
+    # graduated pool); we want the most-liquid one as the "real" price.
+    mints_set = set(mints)
+    best_per_mint: dict[str, dict] = {}
+    for pair in pairs:
+        base = pair.get("baseToken") or {}
+        mint = base.get("address")
+        if not mint or mint not in mints_set:
+            continue
+        liq = float((pair.get("liquidity") or {}).get("usd", 0) or 0)
+        existing = best_per_mint.get(mint)
+        existing_liq = (
+            float((existing.get("liquidity") or {}).get("usd", 0) or 0)
+            if existing else -1
+        )
+        if liq > existing_liq:
+            best_per_mint[mint] = pair
+
+    out: dict[str, float] = {}
+    for mint, pair in best_per_mint.items():
+        try:
+            price = float(pair.get("priceUsd") or 0)
+            if price > 0:
+                out[mint] = price
+        except (ValueError, TypeError):
+            continue
+
+    return out
+
+
 async def _fetch_pumpfun_prices_batched(
     client, rpc_urls: list[str], positions: list[dict]
 ) -> dict[int, "_MarkResult"]:
@@ -565,8 +663,39 @@ async def _fetch_pumpfun_prices_batched(
             continue
 
     if value is None:
-        # All RPCs failed — propagate a combined error to every position
-        err = "all RPCs failed: " + "; ".join(errors_by_rpc[:3])
+        # All RPCs failed (slot lag or errors). Last-resort fallback:
+        # DEXScreener has its own off-chain indexer that polls the chain
+        # independently. For tokens it's already indexed (typically true
+        # for tokens >5s old), it returns priceUsd directly via HTTP.
+        # For very fresh launches it won't have data yet — same failure
+        # mode as the public RPC, but free and worth one more attempt.
+        ds_prices = await _fetch_pumpfun_prices_dexscreener(client, positions)
+        if ds_prices:
+            # Got at least one position priced via DEXScreener. Build
+            # results, marking the rest as failed.
+            out: dict[int, _MarkResult] = {}
+            for p in positions:
+                token_addr = p.get("address")
+                if token_addr in ds_prices:
+                    out[p["id"]] = _MarkResult(
+                        p["pool_address"], ds_prices[token_addr]
+                    )
+                else:
+                    out[p["id"]] = _MarkResult(
+                        p["pool_address"], None,
+                        "all RPCs slot-lagged AND DEXScreener didn't have this token"
+                    )
+            # Log when DEXScreener actually saves the day so we know it's
+            # earning its place in the chain
+            n_saved = len(ds_prices)
+            log.info(
+                "DEXScreener fallback saved %d/%d positions after all RPCs slot-lagged",
+                n_saved, len(positions),
+            )
+            return out
+
+        # DEXScreener also failed — propagate a combined error
+        err = "all RPCs+DS failed: " + "; ".join(errors_by_rpc[:3])
         if len(errors_by_rpc) > 3:
             err += f"; (+{len(errors_by_rpc)-3} more)"
         return {pid: _MarkResult(pdas[i], None, err) for i, pid in enumerate(pos_ids)}
