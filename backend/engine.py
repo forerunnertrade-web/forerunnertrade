@@ -179,15 +179,30 @@ class SimulationEngine:
             # model; the tokens are designed to extract value, not appreciate.
             # Default ON. Set to False to disable for A/B.
             "skipRepeatDev": True,
+            # Latency modeling. Real Solana transactions confirm 400-2000ms
+            # after submission. During that window pump.fun curves can move
+            # 20-50% on fresh launches. Without this, paper trades fill at
+            # the price seen at SIGNAL time, which is optimistic. With this
+            # on, the engine waits modelLatencyMs, then re-reads the curve
+            # and uses THAT price as the fill spot (with slippage applied
+            # on top). If the re-read fails (RPC error, curve graduated,
+            # PDA not found), the trade is skipped — same as a failed tx
+            # would be in live trading. Default ON.
+            "modelLatency": True,
+            "modelLatencyMs": 1200,  # 1.2s — midpoint of typical Solana confirmation
         }
 
         # In-memory set of dev_address values we've ever seen send a pump.fun
         # signal. Used by the skipRepeatDev filter. Survives engine lifetime
-        # but resets across process restarts (we accept some warm-up cost in
-        # exchange for not paying a DB round-trip on every signal).
-        # Could be hydrated from past signals on startup; deferred until we
-        # know whether this filter holds up empirically.
+        # but resets across process restarts. Now hydrated from the signals
+        # table on startup (see hydrate()) so the seen-set persists across
+        # Railway redeploys.
         self._seen_devs: set[str] = set()
+
+        # Count of opens currently in-flight (signal accepted, fill delayed
+        # by latency model, not yet a real position). Counts against
+        # maxConcurrent so we don't over-commit during latency windows.
+        self._in_flight_opens: int = 0
 
         # Signal queue — populated by scanners via add_signal()
         self._signals: asyncio.Queue = asyncio.Queue(maxsize=200)
@@ -227,6 +242,154 @@ class SimulationEngine:
         except Exception:
             return 85.0  # absolute last resort
 
+    # ─── Open helpers ─────────────────────────────────────────────────────────
+    def _open_position_now(
+        self, sig: dict, entry_spot: float, now_ms: int,
+        opened_signals_in_tick: list,
+    ) -> bool:
+        """Synchronous immediate open: compute fill (with slippage if on),
+        create Position, deduct cash, log. Returns True if position opened,
+        False if skipped (degenerate slippage sim result).
+
+        This is the existing behavior, extracted for reuse by the delayed
+        latency path. Called either directly (no-latency mode) or from
+        _complete_delayed_open after the latency window.
+        """
+        source = sig.get("source", "scanner")
+        if source == "pumpfun":
+            dex_hint = "pumpfun"
+        elif sig.get("chain") in ("ETH", "BASE", "BSC", "POLY", "ARB"):
+            dex_hint = "uniswap-v2"
+        else:
+            dex_hint = "raydium"
+
+        size_usd = self.params["positionSizeUsd"]
+        if self.params.get("modelSlippage", True) and dex_hint == "pumpfun":
+            from slippage import simulate_buy
+            sol_usd = self._cached_sol_usd()
+            fill = simulate_buy(entry_spot, size_usd, sol_usd)
+            if fill.quantity > 0:
+                qty = fill.quantity
+                entry_px = fill.effective_price
+            else:
+                log.warning(
+                    "OPEN skipped: slippage sim returned 0 for %s "
+                    "(spot=%.10g, sol_usd=%.2f)",
+                    sig.get("symbol"), entry_spot, sol_usd
+                )
+                return False
+        else:
+            qty = size_usd / entry_spot
+            entry_px = entry_spot
+
+        pos = Position(
+            id=self._next(),
+            chain=sig.get("chain", "?"),
+            symbol=sig.get("symbol", "?"),
+            address=sig.get("address"),
+            qty=qty,
+            entry_px=entry_px,
+            mark_px=entry_px,
+            bias=0.0,
+            tp_pct=self.params["takeProfitPct"],
+            sl_pct=self.params["stopLossPct"],
+            opened_at=now_ms,
+            pool_address=sig.get("pool_address"),
+            quote_address=sig.get("quote_address"),
+            dex=dex_hint,
+        )
+        self.positions[pos.id] = pos
+        self.cash -= size_usd
+        log.info(
+            "OPEN %s %s qty=%.4f @ $%.6g (spot=$%.6g)",
+            pos.chain, pos.symbol, qty, entry_px, entry_spot
+        )
+        sig_pool = sig.get("pool_address")
+        if sig_pool:
+            opened_signals_in_tick.append(
+                (sig.get("chain", "?"), sig_pool, pos.id)
+            )
+        return True
+
+    async def _complete_delayed_open(
+        self, sig: dict, entry_spot_at_signal: float,
+        reserved_cash: float, opened_at_ms: int,
+    ) -> None:
+        """Wait modelLatencyMs, re-read the bonding curve, and either
+        complete the open at the new spot price or refund the reservation.
+
+        Critical invariant: caller has already deducted reserved_cash from
+        self.cash and incremented self._in_flight_opens. This method MUST
+        either complete the open (consuming the reservation by leaving cash
+        deducted and creating the position) or refund (add cash back).
+        Either way it decrements _in_flight_opens.
+
+        The re-read uses price_oracle's batched pump.fun fetcher targeting
+        the SOL_PRICE_RPC_URL (not the scanner's Helius), so we don't
+        cannibalize scanner rate limit.
+        """
+        try:
+            latency_ms = int(self.params.get("modelLatencyMs", 1200))
+            await asyncio.sleep(latency_ms / 1000.0)
+
+            # Re-read the curve. We piggyback on the existing batched fetcher
+            # by passing a synthetic 1-position list. It returns a dict
+            # {pos_id: price}; if the position id key isn't present, the
+            # read failed.
+            from price_oracle import fetch_position_prices
+            pseudo_pos = {
+                "id": -1,  # synthetic id, doesn't conflict with real positions
+                "chain": "SOL",
+                "dex": "pumpfun",
+                "pool_address": sig.get("pool_address"),
+                "address": sig.get("address"),
+            }
+            try:
+                prices = await fetch_position_prices([pseudo_pos])
+            except Exception as e:
+                log.warning(
+                    "LATENCY re-read failed for %s: %s — refunding",
+                    sig.get("symbol"), e,
+                )
+                prices = {}
+
+            new_spot = prices.get(-1)
+            if new_spot is None or new_spot <= 0:
+                # Couldn't re-read curve — simulates failed transaction.
+                # Refund the reservation, log, and bail.
+                self.cash += reserved_cash
+                log.info(
+                    "FAILED_FILL %s (re-read returned no price; equivalent to "
+                    "reverted tx) — refunded $%.2f",
+                    sig.get("symbol"), reserved_cash,
+                )
+                return
+
+            # We have a new spot. Complete the open with the synchronous
+            # helper, which handles slippage on top. Note: it will deduct
+            # size_usd again, so we refund the reservation first to keep
+            # cash math consistent.
+            self.cash += reserved_cash
+            # Update the signal's spot so the helper uses the post-latency price
+            sig = dict(sig)
+            sig["final_price_usd"] = new_spot
+            opened_signals_in_tick: list = []  # local; consumed below
+            opened = self._open_position_now(
+                sig, new_spot, opened_at_ms, opened_signals_in_tick
+            )
+            if not opened:
+                # Helper logged the reason; nothing else to do
+                return
+
+            # Persist the acted-on signal row(s) the helper recorded.
+            # Same path as the synchronous loop would have taken.
+            for chain_name, pool, pos_id in opened_signals_in_tick:
+                asyncio.create_task(self._safe_mark_signal_acted(
+                    chain_name, pool, pos_id
+                ))
+        finally:
+            self._in_flight_opens = max(0, self._in_flight_opens - 1)
+
     # ─── Hydration ────────────────────────────────────────────────────────────
     async def hydrate(self) -> None:
         """Load persisted state from Supabase on startup. Safe to call
@@ -241,6 +404,11 @@ class SimulationEngine:
             trades = await db.load_trades(limit=200)
             positions = await db.load_positions()
             equity = await db.load_equity(limit=500)
+            # Hydrate the seen-devs set from past pump.fun signals so the
+            # repeat-dev filter survives Railway redeploys. Without this,
+            # every redeploy gives the bot a fresh seen-set and the filter
+            # is artificially lenient for the first hour.
+            seen_devs = await db.load_seen_devs()
 
             async with self._lock:
                 if settings:
@@ -287,9 +455,18 @@ class SimulationEngine:
                     # Resume tick counter from where we left off
                     self.tick_count = equity[-1]["t"]
 
+                # Apply hydrated seen-devs so the repeat-dev filter is
+                # immediately effective at the same level it was before
+                # the deploy. Replaces (not merges) because the loaded set
+                # is the complete history.
+                if seen_devs:
+                    self._seen_devs = seen_devs
+
             log.info(
-                "Hydrated: %d positions, %d trades, %d equity points, cash=$%.2f",
-                len(self.positions), len(self.trades), len(self.equity), self.cash
+                "Hydrated: %d positions, %d trades, %d equity points, "
+                "%d seen-devs, cash=$%.2f",
+                len(self.positions), len(self.trades), len(self.equity),
+                len(self._seen_devs), self.cash
             )
         except Exception:
             log.exception("Engine hydration failed; starting fresh")
@@ -511,9 +688,11 @@ class SimulationEngine:
                 )
 
             # ── 3. Try to open a new position ───────────────────────────────
+            # Cap check now includes in-flight (latency-delayed) opens so
+            # we don't over-commit while a fill is pending.
             if (
                 self._signals.qsize() > 0
-                and len(self.positions) < self.params["maxConcurrent"]
+                and (len(self.positions) + self._in_flight_opens) < self.params["maxConcurrent"]
                 and self.cash >= self.params["positionSizeUsd"]
             ):
                 try:
@@ -523,82 +702,28 @@ class SimulationEngine:
                 if sig and self._signal_passes(sig):
                     entry_spot = float(sig.get("final_price_usd") or 1.0)
                     if entry_spot > 0:
-                        # Map signal source → dex hint for the price oracle.
-                        # pumpfun signals need to read bonding-curve PDA;
-                        # scanner/trending signals on Solana hit Raydium V4.
                         source = sig.get("source", "scanner")
-                        if source == "pumpfun":
-                            dex_hint = "pumpfun"
-                        elif sig.get("chain") in ("ETH", "BASE", "BSC", "POLY", "ARB"):
-                            dex_hint = "uniswap-v2"  # default EVM
-                        else:
-                            dex_hint = "raydium"
-
-                        # Apply buy-side slippage on pump.fun. The signal's
-                        # final_price_usd is the pre-trade SPOT — our buy
-                        # moves the curve up, so the effective fill price is
-                        # higher and we receive fewer tokens than spot suggests.
-                        # Without this, paper P&L overstates real returns.
-                        size_usd = self.params["positionSizeUsd"]
-                        skip_open = False
-                        if self.params.get("modelSlippage", True) and dex_hint == "pumpfun":
-                            from slippage import simulate_buy
-                            # SOL/USD is needed to back out the curve reserves
-                            # from the spot price. Use the cached value from
-                            # the price oracle (set during the last refresh)
-                            # or the fallback if no cache yet.
-                            sol_usd = self._cached_sol_usd()
-                            fill = simulate_buy(entry_spot, size_usd, sol_usd)
-                            if fill.quantity > 0:
-                                qty = fill.quantity
-                                entry_px = fill.effective_price
-                            else:
-                                # Slippage sim failed (degenerate input) —
-                                # skip this signal rather than open at a
-                                # potentially wrong price
-                                log.warning(
-                                    "OPEN skipped: slippage sim returned 0 for %s "
-                                    "(spot=%.10g, sol_usd=%.2f)",
-                                    sig.get("symbol"), entry_spot, sol_usd
-                                )
-                                skip_open = True
-                        else:
-                            qty = size_usd / entry_spot
-                            entry_px = entry_spot
-
-                        if not skip_open:
-                            pos = Position(
-                                id=self._next(),
-                                chain=sig.get("chain", "?"),
-                                symbol=sig.get("symbol", "?"),
-                                address=sig.get("address"),
-                                qty=qty,
-                                entry_px=entry_px,
-                                mark_px=entry_px,
-                                bias=0.0,  # live entries don't drift artificially
-                                tp_pct=self.params["takeProfitPct"],
-                                sl_pct=self.params["stopLossPct"],
-                                opened_at=now_ms,
-                                pool_address=sig.get("pool_address"),
-                                quote_address=sig.get("quote_address"),
-                                dex=dex_hint,
-                            )
-                            self.positions[pos.id] = pos
+                        # Decide: latency-delayed fill (pump.fun + latency on)
+                        # or immediate fill?
+                        use_latency = (
+                            source == "pumpfun"
+                            and self.params.get("modelLatency", True)
+                            and sig.get("pool_address")
+                        )
+                        if use_latency:
+                            # Reserve cash + counter NOW so other signals
+                            # don't over-commit. Spawn delayed-fill task.
+                            size_usd = self.params["positionSizeUsd"]
                             self.cash -= size_usd
-                            position_set_dirty = True
-                            log.info(
-                                "OPEN %s %s qty=%.4f @ $%.6g (spot=$%.6g)",
-                                pos.chain, pos.symbol, qty, entry_px, entry_spot
+                            self._in_flight_opens += 1
+                            asyncio.create_task(self._complete_delayed_open(
+                                sig, entry_spot, size_usd, now_ms
+                            ))
+                        else:
+                            # Synchronous immediate fill (existing path)
+                            self._open_position_now(
+                                sig, entry_spot, now_ms, opened_signals_in_tick
                             )
-                            # Mark the corresponding signal row as acted-on.
-                            # The signal's `pool_address` was set when the signal
-                            # was queued. chain normalization: signals table
-                            # stores internal names ("ethereum") not codes ("ETH"),
-                            # so map back via the same helper used in main.py.
-                            sig_pool = sig.get("pool_address")
-                            if sig_pool:
-                                opened_signal = (sig.get("chain", "?"), sig_pool, pos.id)
-                                opened_signals_in_tick.append(opened_signal)
 
             # ── 4. Equity snapshot ──────────────────────────────────────────
             open_value = sum(p.qty * p.mark_px for p in self.positions.values())

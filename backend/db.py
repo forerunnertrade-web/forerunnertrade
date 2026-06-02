@@ -284,6 +284,35 @@ async def load_positions() -> list[dict]:
     return [_position_row_to_engine_shape(r) for r in resp.json()]
 
 
+async def load_seen_devs(limit: int = 20000) -> set[str]:
+    """Return the set of all pump.fun deployer addresses we've ever observed.
+
+    Used by the engine to hydrate the skipRepeatDev filter on startup so
+    that Railway redeploys don't reset the seen-set. The default limit of
+    20k is generous — at our rate of ~5k pump.fun signals per day, this
+    holds about 4 days of history, which is plenty for the filter to
+    behave correctly after a deploy.
+
+    Returns an empty set if Supabase isn't configured or the query fails.
+    The engine treats an empty seen-set as "fresh start" which is the safe
+    default — worst case is the filter is too lenient for the first hour.
+    """
+    resp = await _request(
+        "GET", "/signals",
+        params={
+            "user_id": f"eq.{DEFAULT_USER_ID}",
+            "source": "eq.pumpfun",
+            "dev_address": "not.is.null",
+            "select": "dev_address",
+            "order": "detected_at.desc",
+            "limit": str(limit),
+        },
+    )
+    if resp is None:
+        return set()
+    return {row["dev_address"] for row in resp.json() if row.get("dev_address")}
+
+
 def _position_row_to_engine_shape(r: dict) -> dict:
     return {
         "id": int(r["client_id"]),
