@@ -40,6 +40,31 @@ _cached_price: Optional[float] = None
 _cached_at: float = 0.0
 
 
+def _short_rpc(url: str) -> str:
+    """Compact representation of an RPC URL for log messages.
+
+    Strips the protocol and API-key query string so logs don't leak
+    secrets while still being identifying. e.g.
+        https://mainnet.helius-rpc.com/?api-key=abc → mainnet.helius-rpc.com
+    """
+    if not url:
+        return "(no rpc)"
+    s = url
+    if s.startswith("https://"):
+        s = s[8:]
+    elif s.startswith("http://"):
+        s = s[7:]
+    # Strip query string (often contains api keys)
+    qpos = s.find("?")
+    if qpos >= 0:
+        s = s[:qpos]
+    # Strip trailing path
+    spos = s.find("/")
+    if spos >= 0:
+        s = s[:spos]
+    return s
+
+
 async def get_eth_usd(rpc_url: str, client: Optional[httpx.AsyncClient] = None) -> float:
     """Return current ETH price in USD. Uses cache if fresh, else fetches.
 
@@ -458,56 +483,98 @@ async def _fetch_pumpfun_price(client, rpc_url, bonding_curve_pda) -> _MarkResul
 
 
 async def _fetch_pumpfun_prices_batched(
-    client, rpc_url: str, positions: list[dict]
+    client, rpc_urls: list[str], positions: list[dict]
 ) -> dict[int, "_MarkResult"]:
-    """Batch-read N pump.fun bonding curves in a single RPC call.
+    """Batch-read N pump.fun bonding curves with multi-RPC failover.
 
-    Why this matters: previously we made one getAccountInfo call per open
-    position, every 5 seconds. With 5 positions that's 60 RPCs/minute just
-    for mark refreshes — enough to blow free-tier quotas on a Solana RPC.
-    `getMultipleAccountsInfo` lets us pack all N into one HTTP request,
-    cutting RPC volume 5x. Same wire format as getAccountInfo, just a list.
+    Tries each URL in rpc_urls in order. The first one that returns a
+    usable batch response (well-formed, no error, at least one curve
+    actually present) is the one we use to decode all positions in the
+    batch. If all RPCs fail, every position gets a "batch failed" error.
 
-    Returns {position_id: _MarkResult}. Each position gets its own result —
-    if the batched call fails entirely, all positions get the same error;
-    if individual entries in the response are null/malformed, only those
-    positions get errors. This preserves the per-position error surfacing
-    in the dispatcher.
+    Why failover matters: free public RPCs have severe slot lag on fresh
+    pump.fun curve accounts — they often can't see a just-deployed PDA
+    for 3-5 seconds. Paid providers (Helius, Alchemy, QuickNode) with
+    staked connections see them in 200-500ms. By trying multiple
+    providers in order, we give the curve multiple chances to be visible
+    and avoid the single-provider failure mode that round-19 logs
+    showed (every fresh launch had its curve invisible to public RPC).
 
-    Limit: Solana RPC caps getMultipleAccountsInfo at ~100 accounts per
+    Order matters: put your fastest/most-reliable RPC first. Failover is
+    sequential, not parallel — we don't fan out the call to all providers,
+    because (a) most signals only need one provider to work, and (b) the
+    failover providers exist as redundancy, not load balancing.
+
+    Limit: Solana RPC caps getMultipleAccounts at ~100 accounts per
     request. We're nowhere near that with `maxConcurrent` of 5-10, so no
-    chunking needed yet. If/when we lift that limit, chunk this here.
+    chunking needed yet.
     """
     import base64
     if not positions:
         return {}
+    if not rpc_urls:
+        # No RPCs configured — every position gets a config error
+        return {p["id"]: _MarkResult(p["pool_address"], None,
+                                      "no SOL price RPC configured")
+                for p in positions}
 
     pdas = [p["pool_address"] for p in positions]
     pos_ids = [p["id"] for p in positions]
 
-    try:
-        resp = await client.post(rpc_url, json={
-            "jsonrpc": "2.0", "id": 1,
-            "method": "getMultipleAccounts",
-            "params": [pdas, {"encoding": "base64"}],
-        })
-        body = resp.json()
-        if "error" in body:
-            # Whole-batch failure — propagate same error to every position
-            err = f"rpc error: {body['error'].get('message', '?')[:80]}"
-            return {pid: _MarkResult(pdas[i], None, err) for i, pid in enumerate(pos_ids)}
+    # Try each RPC URL in order until one returns a usable response.
+    # "Usable" = response is well-formed AND at least one account is
+    # non-null (any all-null response indicates slot lag, not a real
+    # answer — try the next provider in case it's caught up).
+    value = None
+    winning_rpc = None
+    errors_by_rpc: list[str] = []
+    for rpc_url in rpc_urls:
+        try:
+            resp = await client.post(rpc_url, json={
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getMultipleAccounts",
+                "params": [pdas, {"encoding": "base64"}],
+            })
+            body = resp.json()
+            if "error" in body:
+                err_msg = body['error'].get('message', '?')[:80]
+                errors_by_rpc.append(f"{_short_rpc(rpc_url)}: rpc error: {err_msg}")
+                continue
+            candidate = (body.get("result") or {}).get("value") or []
+            if len(candidate) != len(positions):
+                errors_by_rpc.append(
+                    f"{_short_rpc(rpc_url)}: response had {len(candidate)} "
+                    f"entries, expected {len(positions)}"
+                )
+                continue
+            # All entries null means the RPC simply hasn't seen these
+            # accounts yet (slot lag). Try the next provider.
+            non_null = sum(1 for v in candidate if v is not None and v.get('data'))
+            if non_null == 0:
+                errors_by_rpc.append(
+                    f"{_short_rpc(rpc_url)}: all {len(candidate)} accounts null "
+                    f"(slot lag — RPC hasn't synced)"
+                )
+                continue
+            # Usable response
+            value = candidate
+            winning_rpc = rpc_url
+            break
+        except Exception as e:
+            errors_by_rpc.append(f"{_short_rpc(rpc_url)}: {type(e).__name__}: {e}")
+            continue
 
-        value = (body.get("result") or {}).get("value") or []
-        if len(value) != len(positions):
-            # Malformed: response should have exactly N entries
-            err = f"batch response had {len(value)} entries, expected {len(positions)}"
-            return {pid: _MarkResult(pdas[i], None, err) for i, pid in enumerate(pos_ids)}
-    except Exception as e:
-        err = f"batch fetch failed: {type(e).__name__}: {e}"
+    if value is None:
+        # All RPCs failed — propagate a combined error to every position
+        err = "all RPCs failed: " + "; ".join(errors_by_rpc[:3])
+        if len(errors_by_rpc) > 3:
+            err += f"; (+{len(errors_by_rpc)-3} more)"
         return {pid: _MarkResult(pdas[i], None, err) for i, pid in enumerate(pos_ids)}
 
-    # SOL/USD once per batch (cached anyway, but no point calling it N times)
-    sol_usd = await _get_sol_usd(client, rpc_url)
+    # We have a usable response. Use the winning RPC's URL for the
+    # SOL/USD fetch too (consistency: same provider for both lookups
+    # within a single fetch).
+    sol_usd = await _get_sol_usd(client, winning_rpc)
 
     out: dict[int, _MarkResult] = {}
     for i, (pos_id, pda, entry) in enumerate(zip(pos_ids, pdas, value)):
@@ -555,26 +622,49 @@ async def fetch_position_prices(positions: list[dict]) -> dict[int, float]:
     the result — caller should hold the previous mark for those.
 
     RPC routing: pump.fun bonding-curve reads are the highest-volume
-    sustained traffic in this system. To avoid blowing free-tier quotas
-    on the scanner's RPC (Helius), the price oracle can use a separate
-    RPC via SOL_PRICE_RPC_URL. Falls back to SOL_HTTP_URL if unset, and
-    finally to the public Solana RPC if neither is configured. EVM and
-    Raydium reads still use their dedicated RPC env vars.
+    sustained traffic in this system AND the most latency-sensitive (fresh
+    launches need to be read within seconds before the curve moves
+    substantially). The price oracle supports up to 3 RPCs in priority
+    order via:
+      - SOL_PRICE_RPC_URL          (primary; e.g. Helius paid tier)
+      - SOL_PRICE_RPC_URL_BACKUP   (secondary; e.g. Alchemy)
+      - SOL_PRICE_RPC_URL_BACKUP2  (tertiary; e.g. QuickNode)
+    The batched fetcher tries each in order, falling back when one returns
+    "slot lag" (curve invisible) or errors. This is essential for fresh
+    pump.fun launches: round-18/19 data showed that public RPC alone has
+    100% slot-lag failure rate on first-second reads. A paid provider as
+    primary with a different paid provider as backup gives the curve two
+    independent chances to be visible.
+    Falls back to SOL_HTTP_URL if no price-RPC env is set, then to the
+    public RPC. EVM and Raydium reads still use their dedicated RPC env
+    vars (unchanged).
     """
     if not positions:
         return {}
 
     eth_rpc = _os.getenv("ETH_HTTP_URL", "")
     sol_rpc = _os.getenv("SOL_HTTP_URL", "")
-    # Price-oracle traffic goes here. If unset, fall back to the scanner
-    # RPC; if that's also unset, try Solana's free public RPC. The latter
-    # is heavily throttled by IP, but better than nothing for paper trading.
-    sol_price_rpc = (
-        _os.getenv("SOL_PRICE_RPC_URL")
-        or sol_rpc
-        or "https://api.mainnet-beta.solana.com"
-    )
-    if not eth_rpc and not sol_rpc and not _os.getenv("SOL_PRICE_RPC_URL"):
+
+    # Assemble the price-RPC priority list. Order matters: primary first.
+    # Empty/unset values are filtered out. Last-resort public RPC is added
+    # only if NO paid RPC is configured (we don't want to fall through to
+    # public after Alchemy + QuickNode both fail — that would mask real
+    # configuration problems).
+    price_rpcs: list[str] = []
+    for env in ("SOL_PRICE_RPC_URL", "SOL_PRICE_RPC_URL_BACKUP",
+                "SOL_PRICE_RPC_URL_BACKUP2"):
+        v = _os.getenv(env)
+        if v:
+            price_rpcs.append(v)
+    if not price_rpcs:
+        # No paid price RPC configured — fall through to scanner RPC and
+        # finally public. This preserves backward compatibility but is
+        # the slow path; production should set at least one paid RPC.
+        if sol_rpc:
+            price_rpcs.append(sol_rpc)
+        price_rpcs.append("https://api.mainnet-beta.solana.com")
+
+    if not eth_rpc and not sol_rpc and not price_rpcs:
         return {}
 
     import asyncio
@@ -611,7 +701,7 @@ async def fetch_position_prices(positions: list[dict]) -> dict[int, float]:
 
         # Fire both paths concurrently
         pumpfun_task = (
-            _fetch_pumpfun_prices_batched(client, sol_price_rpc, pumpfun_positions)
+            _fetch_pumpfun_prices_batched(client, price_rpcs, pumpfun_positions)
             if pumpfun_positions else asyncio.sleep(0, result={})
         )
         if other_tasks:
