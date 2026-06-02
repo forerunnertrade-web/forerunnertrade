@@ -180,16 +180,22 @@ class SimulationEngine:
             # Default ON. Set to False to disable for A/B.
             "skipRepeatDev": True,
             # Latency modeling. Real Solana transactions confirm 400-2000ms
-            # after submission. During that window pump.fun curves can move
-            # 20-50% on fresh launches. Without this, paper trades fill at
-            # the price seen at SIGNAL time, which is optimistic. With this
-            # on, the engine waits modelLatencyMs, then re-reads the curve
-            # and uses THAT price as the fill spot (with slippage applied
-            # on top). If the re-read fails (RPC error, curve graduated,
-            # PDA not found), the trade is skipped — same as a failed tx
-            # would be in live trading. Default ON.
+            # after submission, but for fresh pump.fun launches the bonding
+            # curve account may not yet be visible to the RPC we're reading.
+            # The model:
+            #   1. Wait modelLatencyMs (initial confirmation delay) — 1.2s
+            #   2. Try to re-read the curve.
+            #   3. If "curve not found" (transient — RPC slot lag), retry
+            #      every modelLatencyRetryMs until modelLatencyMaxMs total.
+            #   4. Fill at whatever spot the first successful read shows.
+            #   5. If max-window exhausted, refund as FAILED_FILL.
+            # This models reality: real transactions confirm whenever the
+            # chain confirms them, and RPC visibility varies. Public RPC may
+            # take 3-5s to see a fresh curve; paid RPCs see it in 1-2s.
             "modelLatency": True,
-            "modelLatencyMs": 1200,  # 1.2s — midpoint of typical Solana confirmation
+            "modelLatencyMs": 1200,
+            "modelLatencyRetryMs": 500,
+            "modelLatencyMaxMs": 5000,  # absolute cap — beyond this, give up
         }
 
         # In-memory set of dev_address values we've ever seen send a pump.fun
@@ -330,59 +336,71 @@ class SimulationEngine:
         """
         try:
             latency_ms = int(self.params.get("modelLatencyMs", 1200))
-            await asyncio.sleep(latency_ms / 1000.0)
+            retry_ms = int(self.params.get("modelLatencyRetryMs", 500))
+            max_ms = int(self.params.get("modelLatencyMaxMs", 5000))
 
-            # Re-read the curve. We piggyback on the existing batched fetcher
-            # by passing a synthetic 1-position list. It returns a dict
-            # {pos_id: price}; if the position id key isn't present, the
-            # read failed.
+            # Initial confirmation wait
+            await asyncio.sleep(latency_ms / 1000.0)
+            elapsed_ms = latency_ms
+
+            # Poll the bonding curve until it appears or we time out.
+            # Reads typically fail with "bonding curve not found" or
+            # "empty curve data" while the RPC catches up to the deploy slot;
+            # those should be retried, not treated as fatal.
             from price_oracle import fetch_position_prices
             pseudo_pos = {
-                "id": -1,  # synthetic id, doesn't conflict with real positions
+                "id": -1,
                 "chain": "SOL",
                 "dex": "pumpfun",
                 "pool_address": sig.get("pool_address"),
                 "address": sig.get("address"),
             }
-            try:
-                prices = await fetch_position_prices([pseudo_pos])
-            except Exception as e:
-                log.warning(
-                    "LATENCY re-read failed for %s: %s — refunding",
-                    sig.get("symbol"), e,
-                )
-                prices = {}
+            new_spot = None
+            attempts = 0
+            while elapsed_ms <= max_ms:
+                attempts += 1
+                try:
+                    prices = await fetch_position_prices([pseudo_pos])
+                    candidate = prices.get(-1)
+                    if candidate is not None and candidate > 0:
+                        new_spot = candidate
+                        break
+                except Exception as e:
+                    # Treat hard RPC errors the same as a missing curve —
+                    # try again until we time out.
+                    log.debug(
+                        "LATENCY re-read attempt %d for %s raised: %s",
+                        attempts, sig.get("symbol"), e,
+                    )
+                # Not visible yet — wait and retry
+                if elapsed_ms + retry_ms > max_ms:
+                    break
+                await asyncio.sleep(retry_ms / 1000.0)
+                elapsed_ms += retry_ms
 
-            new_spot = prices.get(-1)
-            if new_spot is None or new_spot <= 0:
-                # Couldn't re-read curve — simulates failed transaction.
-                # Refund the reservation, log, and bail.
+            if new_spot is None:
+                # Window exhausted without ever reading the curve.
+                # Simulates a transaction that simply doesn't confirm in time.
                 self.cash += reserved_cash
                 log.info(
-                    "FAILED_FILL %s (re-read returned no price; equivalent to "
-                    "reverted tx) — refunded $%.2f",
-                    sig.get("symbol"), reserved_cash,
+                    "FAILED_FILL %s after %d attempts in %dms (curve never "
+                    "visible to RPC) — refunded $%.2f",
+                    sig.get("symbol"), attempts, elapsed_ms, reserved_cash,
                 )
                 return
 
-            # We have a new spot. Complete the open with the synchronous
-            # helper, which handles slippage on top. Note: it will deduct
-            # size_usd again, so we refund the reservation first to keep
-            # cash math consistent.
+            # We have a fill price. Refund the reservation (the synchronous
+            # helper deducts cash again) and complete the open.
             self.cash += reserved_cash
-            # Update the signal's spot so the helper uses the post-latency price
             sig = dict(sig)
             sig["final_price_usd"] = new_spot
-            opened_signals_in_tick: list = []  # local; consumed below
+            opened_signals_in_tick: list = []
             opened = self._open_position_now(
                 sig, new_spot, opened_at_ms, opened_signals_in_tick
             )
             if not opened:
-                # Helper logged the reason; nothing else to do
                 return
 
-            # Persist the acted-on signal row(s) the helper recorded.
-            # Same path as the synchronous loop would have taken.
             for chain_name, pool, pos_id in opened_signals_in_tick:
                 asyncio.create_task(self._safe_mark_signal_acted(
                     chain_name, pool, pos_id
