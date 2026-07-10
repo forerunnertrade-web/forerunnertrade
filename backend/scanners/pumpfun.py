@@ -64,6 +64,13 @@ class PumpFunScanner(BaseScanner):
                     # Subscribe to new token launches. The API expects
                     # {"method": "subscribeNewToken"} per the docs.
                     await ws.send(json.dumps({"method": "subscribeNewToken"}))
+                    # Also subscribe to migration events — when a token graduates
+                    # from bonding curve to Raydium or PumpSwap. This lets us
+                    # detect the migration event without running our own
+                    # logsSubscribe listener on account 39azUYFWPz3VHgKCf...
+                    # We treat migrations as a distinct signal source that
+                    # main.py routes to a separate handler.
+                    await ws.send(json.dumps({"method": "subscribeMigration"}))
 
                     backoff = self.reconnect_seconds  # reset backoff on successful connect
 
@@ -86,23 +93,24 @@ class PumpFunScanner(BaseScanner):
                 backoff = min(60.0, backoff * 1.5)
 
     async def _handle_message(self, msg: str) -> None:
-        """Parse one PumpPortal frame; emit PoolEvent if it's a new token.
+        """Route incoming PumpPortal messages by txType.
 
-        Expected payload (from PumpPortal docs):
+        - "create"                → new token launch → emit dex='pumpfun' event
+        - "migrate" / "migration" → graduation → emit dex='graduation' event
+        - anything else (subscription acks, heartbeats, unknown types) → ignore
+
+        Expected newToken payload (from PumpPortal docs):
         {
-          "signature": "...",
-          "mint": "tokenMintAddress",
-          "traderPublicKey": "...",
-          "txType": "create",
-          "initialBuy": 67000000,
-          "bondingCurveKey": "...",
-          "vTokensInBondingCurve": ...,
-          "vSolInBondingCurve": ...,
-          "marketCapSol": 27.95,
-          "name": "Token name",
-          "symbol": "TICKER",
-          "uri": "https://..."
+          "signature": "...", "mint": "...", "traderPublicKey": "...",
+          "txType": "create", "initialBuy": 67000000,
+          "bondingCurveKey": "...", "vTokensInBondingCurve": ...,
+          "vSolInBondingCurve": ..., "marketCapSol": 27.95,
+          "name": "Token name", "symbol": "TICKER", "uri": "https://..."
         }
+
+        Migration payload shape is less well-documented publicly; we accept
+        several field naming conventions defensively and preserve the raw
+        payload in event.raw for downstream analysis.
         """
         try:
             data = json.loads(msg)
@@ -113,9 +121,15 @@ class PumpFunScanner(BaseScanner):
         # {"message": "Successfully subscribed to ..."}. Skip it.
         if "txType" not in data:
             return
-        if data.get("txType") != "create":
-            return
+        tx_type = data.get("txType")
+        if tx_type == "create":
+            await self._handle_new_token(data)
+        elif tx_type in ("migrate", "migration"):
+            await self._handle_migration(data)
+        # Other txTypes (trade events on subscribed tokens, etc.) are ignored.
 
+    async def _handle_new_token(self, data: dict) -> None:
+        """Emit a PoolEvent for a new pump.fun token launch."""
         mint = data.get("mint")
         if not mint:
             return
@@ -156,4 +170,61 @@ class PumpFunScanner(BaseScanner):
             (trader or "?")[:10],
         )
 
+        await self.handler(event)
+
+    async def _handle_migration(self, data: dict) -> None:
+        """Emit a graduation event with dex='graduation'. main.py routes
+        these to a separate handler that schedules delayed evaluation."""
+        mint = data.get("mint")
+        if not mint:
+            return
+        # PumpPortal's migration payload may include the destination pool
+        # under different key names; try common variants and fall back to
+        # the mint (main.py will resolve pool via DEXScreener if needed).
+        pool = (
+            data.get("pool")
+            or data.get("poolAddress")
+            or data.get("raydiumPool")
+            or data.get("pumpswapPool")
+            or mint
+        )
+        # Destination detection is best-effort — the payload may or may not
+        # include an explicit field. We check common keys and fall back to
+        # string-matching the raw payload since it's cheap and often works.
+        destination = (
+            data.get("destination")
+            or data.get("dex")
+        )
+        if not destination:
+            raw_str = str(data).lower()
+            if "pumpswap" in raw_str or "pamm" in raw_str:
+                destination = "pumpswap"
+            elif "raydium" in raw_str:
+                destination = "raydium"
+            else:
+                destination = "unknown"
+
+        event = PoolEvent(
+            chain="solana",
+            dex="graduation",
+            pool_address=pool,
+            token0=mint,
+            token1=WSOL_MINT,
+            block_or_slot=0,
+            tx_hash=data.get("signature", ""),
+            deployer=None,
+            raw={
+                "destination": destination,
+                "symbol": data.get("symbol"),
+                "name": data.get("name"),
+                "received_at": time.time(),
+                # Preserve the whole raw payload in case PumpPortal's schema
+                # evolves and we later need fields we didn't know about now.
+                "raw_payload": data,
+            },
+        )
+        log.info(
+            "pumpfun: graduation mint=%s dest=%s pool=%s",
+            mint[:10], destination, (pool[:10] if pool else "?"),
+        )
         await self.handler(event)

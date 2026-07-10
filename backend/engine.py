@@ -196,6 +196,28 @@ class SimulationEngine:
             "modelLatencyMs": 1200,
             "modelLatencyRetryMs": 500,
             "modelLatencyMaxMs": 5000,  # absolute cap — beyond this, give up
+
+            # Graduation-strategy params. When a graduation signal arrives
+            # from the pump.fun scanner, we don't buy immediately (the
+            # academic paper on pump.fun market structure — Marino et al
+            # 2026 — shows that whales dump into graduation, so the moment
+            # of graduation is a structural sell wall). Instead we wait
+            # gradWaitMinutes, then check via DEXScreener whether the token
+            # has stabilized: liquidity above threshold AND price hasn't
+            # dropped more than gradMaxDropPct from graduation-time spot.
+            # Only if both hold do we open a position.
+            #
+            # Rationale for waiting: filter out both (a) rugs that dump to
+            # zero immediately post-graduation and (b) the whale sell wall
+            # itself. Post-dump stabilization is where the tradeable
+            # opportunity is (if it exists at all).
+            #
+            # These defaults are best-guesses from the academic paper. If
+            # this strategy shows edge, we'd tune based on actual data.
+            "gradEnabled": True,
+            "gradWaitMinutes": 10,
+            "gradMinLiquidityUsd": 10000.0,
+            "gradMaxDropPct": 40.0,
         }
 
         # In-memory set of dev_address values we've ever seen send a pump.fun
@@ -209,6 +231,14 @@ class SimulationEngine:
         # by latency model, not yet a real position). Counts against
         # maxConcurrent so we don't over-commit during latency windows.
         self._in_flight_opens: int = 0
+
+        # Pending graduation signals: list of dicts {sig, eval_at_ms,
+        # initial_price_usd}. Populated by add_graduation(); drained by
+        # _process_pending_graduations() on each tick.
+        self._pending_graduations: list[dict] = []
+        # Guard against stacking graduation-processor tasks if DEXScreener
+        # is slow (analogous to _price_refresh_inflight).
+        self._grad_processing_inflight: bool = False
 
         # Signal queue — populated by scanners via add_signal()
         self._signals: asyncio.Queue = asyncio.Queue(maxsize=200)
@@ -578,6 +608,165 @@ class SimulationEngine:
             except (asyncio.QueueEmpty, asyncio.QueueFull):
                 pass
 
+    async def add_graduation(self, signal: dict) -> None:
+        """Called by the scanner pipeline when a pump.fun token graduates
+        to Raydium or PumpSwap. Unlike add_signal, we don't act now — we
+        schedule evaluation after gradWaitMinutes to let the graduation-
+        dump complete before deciding whether the token has stabilized.
+
+        The signal is expected to have at least: address (token mint),
+        pool_address, symbol, source='graduation', and optionally
+        initial_price_usd (best guess of price at graduation moment).
+        """
+        if not self.params.get("gradEnabled", True):
+            log.info("graduation ignored (gradEnabled=False): %s",
+                     signal.get("symbol"))
+            return
+        wait_ms = int(self.params.get("gradWaitMinutes", 10) * 60_000)
+        eval_at_ms = int(time.time() * 1000) + wait_ms
+        self._pending_graduations.append({
+            "sig": signal,
+            "eval_at_ms": eval_at_ms,
+            "initial_price_usd": signal.get("initial_price_usd"),
+        })
+        log.info(
+            "graduation queued: %s dest=%s eval_at=+%dm (pending=%d)",
+            signal.get("symbol") or signal.get("address", "?")[:10],
+            (signal.get("destination") or "?"),
+            self.params.get("gradWaitMinutes", 10),
+            len(self._pending_graduations),
+        )
+
+    async def _process_pending_graduations(self) -> None:
+        """Called each tick. For each pending graduation whose eval_at has
+        passed: fetch current price+liquidity via DEXScreener, decide to
+        act or discard, and remove from the pending list."""
+        if not self._pending_graduations:
+            return
+        now_ms = int(time.time() * 1000)
+        due = [p for p in self._pending_graduations if now_ms >= p["eval_at_ms"]]
+        if not due:
+            return
+
+        # Batch DEXScreener lookup for all due tokens (up to 30 per HTTP
+        # request; we're nowhere near that limit at typical graduation rates)
+        mints = [p["sig"]["address"] for p in due if p["sig"].get("address")]
+        prices_and_liq = await self._fetch_dexscreener_price_and_liquidity(mints)
+
+        min_liq = float(self.params.get("gradMinLiquidityUsd", 10000))
+        max_drop = float(self.params.get("gradMaxDropPct", 40))
+
+        still_pending = [
+            p for p in self._pending_graduations if now_ms < p["eval_at_ms"]
+        ]
+
+        for pg in due:
+            sig = pg["sig"]
+            addr = sig.get("address")
+            symbol = sig.get("symbol") or (addr[:10] if addr else "?")
+            data = prices_and_liq.get(addr) if addr else None
+
+            if data is None:
+                log.info("graduation DISCARD %s: DEXScreener has no price yet", symbol)
+                continue
+            price, liq = data
+            if liq is None or liq < min_liq:
+                log.info("graduation DISCARD %s: liq $%.0f < $%.0f threshold",
+                         symbol, liq or 0, min_liq)
+                continue
+            initial = pg.get("initial_price_usd")
+            if initial and initial > 0:
+                drop_pct = (initial - price) / initial * 100
+                if drop_pct > max_drop:
+                    log.info(
+                        "graduation DISCARD %s: dropped %.1f%% from graduation "
+                        "(> %.1f%% threshold)",
+                        symbol, drop_pct, max_drop,
+                    )
+                    continue
+
+            # Passes both filters — hand off to the normal signals queue
+            # as a signal from source='graduation'. The engine's usual
+            # signal-processing loop will pick it up and open a position
+            # on the next tick, subject to maxConcurrent and cash checks.
+            new_sig = dict(sig)
+            new_sig["final_price_usd"] = price
+            new_sig["liq_usd"] = liq
+            new_sig["source"] = "graduation"
+            # Bypass pump.fun-specific filters (dev-bracket, repeat-dev):
+            # these were tuned for fresh-launch signals. Graduation tokens
+            # are a different population and those filters shouldn't apply.
+            # _signal_passes checks source == 'pumpfun' before running
+            # them, so as long as source stays 'graduation' we're fine.
+            log.info(
+                "graduation ACT %s: price=$%.8f, liq=$%.0f — queueing signal",
+                symbol, price, liq,
+            )
+            try:
+                self._signals.put_nowait(new_sig)
+            except asyncio.QueueFull:
+                log.warning("Signal queue full when queueing graduation %s", symbol)
+
+        self._pending_graduations = still_pending
+
+    async def _fetch_dexscreener_price_and_liquidity(
+        self, mints: list[str]
+    ) -> dict[str, tuple[float, float]]:
+        """Query DEXScreener's /tokens endpoint for prices AND liquidity.
+
+        Returns {mint: (price_usd, liquidity_usd)} for any mints that had
+        at least one indexed pair. Mints without indexed pairs are absent.
+
+        Uses the highest-liquidity pair per mint (typically the graduated
+        pool). Post-graduation, DEXScreener usually indexes the destination
+        pool within seconds.
+        """
+        if not mints:
+            return {}
+        if len(mints) > 30:
+            mints = mints[:30]
+        url = "https://api.dexscreener.com/latest/dex/tokens/" + ",".join(mints)
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(url)
+                if resp.status_code != 200:
+                    log.debug("DEXScreener graduation lookup returned HTTP %d", resp.status_code)
+                    return {}
+                body = resp.json()
+        except Exception as e:
+            log.debug("DEXScreener graduation lookup failed: %s", e)
+            return {}
+
+        pairs = body.get("pairs") or []
+        if not pairs:
+            return {}
+        mints_set = set(mints)
+        best_per_mint: dict[str, dict] = {}
+        for pair in pairs:
+            base = pair.get("baseToken") or {}
+            mint = base.get("address")
+            if not mint or mint not in mints_set:
+                continue
+            liq = float((pair.get("liquidity") or {}).get("usd", 0) or 0)
+            existing = best_per_mint.get(mint)
+            existing_liq = (
+                float((existing.get("liquidity") or {}).get("usd", 0) or 0)
+                if existing else -1
+            )
+            if liq > existing_liq:
+                best_per_mint[mint] = pair
+        out = {}
+        for mint, pair in best_per_mint.items():
+            try:
+                price = float(pair.get("priceUsd") or 0)
+                liq = float((pair.get("liquidity") or {}).get("usd", 0) or 0)
+                if price > 0:
+                    out[mint] = (price, liq)
+            except (ValueError, TypeError):
+                continue
+        return out
+
     async def snapshot(self) -> EnginePublicState:
         """Atomic read of engine state. The dashboard polls this."""
         async with self._lock:
@@ -793,6 +982,23 @@ class SimulationEngine:
         # under network slowness).
         if tick_t % PRICE_REFRESH_TICKS == 0 and not self._price_refresh_inflight:
             asyncio.create_task(self._refresh_prices(positions_to_quote=positions_to_quote))
+
+        # ── 7. Graduation-pending processor ──────────────────────────────────
+        # Outside the lock for the same reason as above (DEXScreener HTTP).
+        # In-flight guard prevents stacking if DEXScreener is slow.
+        if self._pending_graduations and not self._grad_processing_inflight:
+            asyncio.create_task(self._process_pending_graduations_safe())
+
+    async def _process_pending_graduations_safe(self) -> None:
+        """Wrapper that guards against concurrent execution and swallows
+        exceptions so a DEXScreener outage can't crash the tick loop."""
+        self._grad_processing_inflight = True
+        try:
+            await self._process_pending_graduations()
+        except Exception:
+            log.exception("graduation processing failed")
+        finally:
+            self._grad_processing_inflight = False
 
     async def _refresh_prices(self, positions_to_quote: list[dict]) -> None:
         """Fetch live spot prices for the given positions; store in cache.

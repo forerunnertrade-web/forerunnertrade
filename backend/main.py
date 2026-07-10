@@ -435,6 +435,89 @@ async def on_pumpfun_launch(event: PoolEvent) -> None:
     await broadcast_metrics(event, pumpfun_metrics)
 
 
+async def on_graduation(event: PoolEvent) -> None:
+    """Handle a pump.fun token graduation to Raydium or PumpSwap.
+
+    Strategy rationale: the moment of graduation is a structural sell wall
+    (whales are incentivized to exit before migration due to shallower
+    post-graduation liquidity; see Marino et al 2026). Rather than buy at
+    graduation moment, we queue the token for evaluation N minutes later
+    (default 10), after the initial dump has completed. At that point we
+    check via DEXScreener whether the token still has meaningful liquidity
+    AND hasn't dropped catastrophically. If both hold, we open a position.
+
+    All the actual delay logic lives in the engine; this handler just
+    packages the event into a signal-shaped dict and hands it off.
+    """
+    raw = event.raw or {}
+    symbol = raw.get("symbol") or event.token0[:8]
+    destination = raw.get("destination") or "unknown"
+
+    log.info(
+        "Graduation received: %s (%s) dest=%s pool=%s",
+        symbol, event.token0[:10], destination,
+        event.pool_address[:10] if event.pool_address else "?",
+    )
+
+    # Persist the graduation event as a signal row for post-hoc analysis.
+    # Even discarded graduations (post-wait filter rejected) will be
+    # recoverable this way. source='graduation' distinguishes them from
+    # 'pumpfun' (fresh launches) in the same table.
+    from db import upsert_signal_phase1, is_configured
+    if is_configured():
+        try:
+            await upsert_signal_phase1(
+                chain="solana",
+                pool_address=event.pool_address,
+                token_address=event.token0,
+                quote_address=event.token1,
+                dex="graduation",
+                symbol=symbol,
+                source="graduation",
+                # No dev_address / dev_initial_buy_sol at graduation — these
+                # are launch-time metrics and the token has been trading for
+                # ~30-60 minutes by this point.
+            )
+        except Exception as e:
+            log.warning("Failed to persist graduation signal: %s", e)
+
+    # Feed the engine. The engine's add_graduation puts it in the pending
+    # queue with an eval_at timestamp; actual evaluation happens
+    # gradWaitMinutes later via the tick loop.
+    from engine import engine
+    await engine.add_graduation({
+        "chain": "SOL",
+        "symbol": symbol,
+        "address": event.token0,
+        "pool_address": event.pool_address,
+        "quote_address": event.token1,
+        "audit_score": 100,  # graduation implies token cleared basic gauntlet
+        "liq_usd": None,     # filled in at evaluation time by DEXScreener
+        "unique_buyers": None,
+        "price_change_pct": None,
+        "final_price_usd": None,  # filled in at evaluation time
+        "breakout_triggered": None,
+        "source": "graduation",
+        "destination": destination,
+        # We don't have a reliable graduation-time price yet — the
+        # evaluation step will just check current price vs $10k liq
+        # threshold without a "drop from initial" check unless we can
+        # supply an initial. If graduation events start including price,
+        # we'll thread it through here.
+        "initial_price_usd": None,
+    })
+
+
+async def on_pumpfun_message(event: PoolEvent) -> None:
+    """Dispatcher: PumpFunScanner emits both new-token events (dex='pumpfun')
+    and graduation events (dex='graduation') through the same handler
+    callback. This wrapper routes each to the appropriate handler."""
+    if event.dex == "graduation":
+        await on_graduation(event)
+    else:
+        await on_pumpfun_launch(event)
+
+
 async def _enrich_and_broadcast_evm(rpc_url: str, event: PoolEvent) -> None:
     """Background EVM enrichment. Throttled by a semaphore."""
     async with _enrich_sem:
@@ -577,11 +660,12 @@ async def main() -> None:
         scanners.append(SuiScanner(on_pool, sui.rpc_ws, sui.factories))
 
     # Pump.fun: separate path because it doesn't follow the
-    # factory-detect-then-audit flow. Bonding-curve tokens need different
-    # treatment — see on_pumpfun_launch below.
+    # factory-detect-then-audit flow. The scanner emits both new-token
+    # events (fresh launches) and migration events (graduations); the
+    # dispatcher on_pumpfun_message routes each to its handler.
     if os.getenv("PUMPFUN_ENABLED", "false").lower() == "true":
-        scanners.append(PumpFunScanner(on_pumpfun_launch))
-        log.info("PumpFun: scanner enabled")
+        scanners.append(PumpFunScanner(on_pumpfun_message))
+        log.info("PumpFun: scanner enabled (launches + graduations)")
     else:
         log.info("PumpFun: scanner disabled (set PUMPFUN_ENABLED=true)")
 
